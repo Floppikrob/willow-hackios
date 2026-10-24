@@ -223,6 +223,7 @@ redwood_input_init(void)
 	redwood_ufs_init();
 	redwood_net_init();
 	redwood_adreno_init();
+	redwood_rpm_init();
 	redwood_a610_init();
 	redwood_wifi_init();
 	redwood_adsp_init();

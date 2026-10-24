@@ -3017,13 +3017,9 @@ static void
 uefi_npa(const char *cmdline)
 {
 	static const efi_guid npa_guid = { 0x79d6c870, 0x725e, 0x489e, { 0xa0, 0xa1, 0x27, 0xe7, 0xa5, 0xd0, 0xcb, 0x35 } };
-	static char resource[48];
+	static char resources[4][48];   /* the framework keeps the names it is given: one buffer each */
 	struct efi_npa_protocol *npa = NULL;
 	const char *c;
-	uint32_t value = 0;
-	unsigned n = 0;
-	void *client = NULL;
-	efi_status st = 0;
 
 	for (c = cmdline; *c; c++) {
 		if (starts_with(c, "uefi_npa=") && (c == cmdline || c[-1] == ' ')) {
@@ -3033,31 +3029,41 @@ uefi_npa(const char *cmdline)
 	if (*c == 0) {
 		return;
 	}
-	for (c += 9; *c && *c != ':' && *c != ' ' && n + 1 < sizeof(resource); c++) {
-		resource[n++] = *c;
-	}
-	resource[n] = 0;
-	for (c += *c == ':'; *c >= '0' && *c <= '9'; c++) {
-		value = value * 10 + (uint32_t)(*c - '0');
-	}
 	if (EFI_ERROR(BS->locate_protocol(&npa_guid, NULL, (void **)&npa)) || npa == NULL) {
 		print("uefi npa: this UEFI has no NPA protocol: nothing asked for\n");
 		return;
 	}
-	print("uefi npa: the NPA protocol, revision %x; a client of %s\n", npa->revision, resource);
-	/* NPA_CLIENT_REQUIRED: bit 6 in the framework's header, bit 8 where it has two more custom types */
-	for (unsigned bit = 6; bit <= 8 && client == NULL; bit += 2) {
-		st = npa->create_sync_client_ex(resource, "xnuloader", 1u << bit, 0, NULL, &client);
-		print("uefi npa: client of type %x: %x, handle %x\n", (uint64_t)(1u << bit), st, (uint64_t)(uintptr_t)client);
-		if (EFI_ERROR(st)) {
-			client = NULL;
+	c += 9;
+	for (unsigned k = 0; k < 4 && *c && *c != ' '; k++) {
+		char *resource = resources[k];
+		uint32_t value = 0;
+		unsigned n = 0;
+		void *client = NULL;
+		efi_status st = 0;
+
+		while (*c && *c != ':' && *c != ',' && *c != ' ' && n + 1 < sizeof(resources[k])) {
+			resource[n++] = *c++;
 		}
+		resource[n] = 0;
+		for (c += *c == ':'; *c >= '0' && *c <= '9'; c++) {
+			value = value * 10 + (uint32_t)(*c - '0');
+		}
+		c += *c == ',';
+		print("uefi npa: the NPA protocol, revision %x; a client of %s\n", npa->revision, resource);
+		/* NPA_CLIENT_REQUIRED: bit 6 in the framework's header, bit 8 where it has two more custom types */
+		for (unsigned bit = 6; bit <= 8 && client == NULL; bit += 2) {
+			st = npa->create_sync_client_ex(resource, "xnuloader", 1u << bit, 0, NULL, &client);
+			print("uefi npa: client of type %x: %x, handle %x\n", (uint64_t)(1u << bit), st, (uint64_t)(uintptr_t)client);
+			if (EFI_ERROR(st)) {
+				client = NULL;
+			}
+		}
+		if (client == NULL) {
+			continue;
+		}
+		st = npa->scalar_request(client, value);
+		print("uefi npa: %s = %d asked for: %x\n", resource, (uint64_t)value, st);
 	}
-	if (client == NULL) {
-		return;
-	}
-	st = npa->scalar_request(client, value);
-	print("uefi npa: %s = %d asked for: %x\n", resource, (uint64_t)value, st);
 }
 
 /*

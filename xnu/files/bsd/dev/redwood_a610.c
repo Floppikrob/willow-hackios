@@ -42,12 +42,20 @@
  *              (the first of the three calls of Linux's qcom_mdt_pas_init; nothing of the GPU)
  *  10  writes  memory of ours for the 3D core, physically in one piece: its ring of commands, its
  *              microcode (fw/a630_sqe.fw, the phone's own, less the file's first word) and a page
- *              to be written on command. The core is given physical addresses: the SMMU's context
- *              0 is off (step 7), and a stream sent to a context that is off is not translated
+ *              to be written on command. The core is given physical addresses
  *  11  writes  the 3D core's registers as Linux's a6xx_hw_init does for an A610 before it starts
- *              the command processor, then starts it and gives it "initialize" (a6xx_cp_init)
- *  12  writes  the core out of secure mode the way Linux does where there is no zap shader
- *              (RBBM_SECVID_TRUST_CNTL = 0, from here), then commands it to write a word into our page
+ *              the command processor, then starts it and gives it "initialize" (a6xx_cp_init).
+ *              With a610_bypass=1 first the SMMU: none of its stream match registers is valid
+ *              (step 7) and sCR0 has USFCFG set, so every stream of the core is refused -- the
+ *              device tree's kgsl-smmu has "qcom,skip-init", it is Linux that programs the GPU's
+ *              streams (gfx3d_user: SID 0 mask 1, gfx3d_secure: SID 2). One match for SIDs 0-3 goes
+ *              to context 4 with its translation off, as arm-smmu-qcom.c's bypass_quirk does: a
+ *              plain bypass S2CR is turned into "fault" by Qualcomm's hypervisor
+ *  12  commands the core to write a word into our page, first as it is (in secure mode: TRUST_CNTL
+ *              reads 1), and if that does not land, after CP_SET_SECURE_MODE 0 -- the packet Linux
+ *              sends once the zap shader is in. Writing RBBM_SECVID_TRUST_CNTL = 0 from here, as
+ *              Linux does where there is no zap shader at all, hung the bus on this phone (the
+ *              write never came back, and the whole kernel stopped some 15 s later): not done
  *
  * Steps 9 to 12 go one after the other whatever 9 says: TrustZone does not take the zap shader's
  * signature here (it answers "not supported", SMCCC's -1), and 12 is the way round it, if there is one.
@@ -183,7 +191,14 @@ gdsc(const char *name, uint32_t offset)
 /* ---- the 3D core: its registers (in words), its ring, its first commands (as bsd/dev/redwood_adreno.c) ---- */
 
 #define GPU_WORD(n)             (4u * (n))
+#define RBBM_GBIF_CLIENT_QOS_CNTL GPU_WORD(0x0011)
 #define RBBM_GBIF_HALT          GPU_WORD(0x0016)
+#define RBBM_GBIF_HALT_ACK      GPU_WORD(0x0017)
+#define RBBM_INTERFACE_HANG_INT_CNTL GPU_WORD(0x001f)
+#define UCHE_CLIENT_PF          GPU_WORD(0x0e19)
+#define GBIF_QSB_SIDE0          GPU_WORD(0x3c03)        /* to 3: the bus interface's four queues */
+#define GBIF_HALT               GPU_WORD(0x3c45)
+#define GBIF_HALT_ACK           GPU_WORD(0x3c46)
 #define RBBM_INT_0_STATUS       GPU_WORD(0x0201)
 #define RBBM_STATUS             GPU_WORD(0x0210)
 #define RBBM_PERFCTR_CNTL       GPU_WORD(0x0500)
@@ -217,6 +232,7 @@ gdsc(const char *name, uint32_t offset)
 
 #define CP_MEM_WRITE            0x3d
 #define CP_ME_INIT              0x48
+#define CP_SET_SECURE_MODE      0x66
 
 #define CORE_RING_SIZE          0x8000u
 #define CORE_SQE_OFFSET         0x8000u
@@ -361,12 +377,25 @@ scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
 	return -1;
 }
 
+extern volatile int redwood_rpm_done;
+
 static void
 a610_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter;
 	bool cx_on, cx_clocks;
 
+	{
+		/* with rpm=N: the RPM's requests first (bsd/dev/redwood_rpm.c), the GPU's path to memory runs on its buses */
+		uint32_t rpm = 0;
+
+		if (PE_parse_boot_argn("rpm", &rpm, sizeof(rpm)) && rpm != 0) {
+			for (int i = 0; i < 500 && !redwood_rpm_done; i++) {
+				delay_for_interval(10, NSEC_PER_MSEC);
+			}
+			printf("a610: the RPM's requests are %s\n", redwood_rpm_done ? "done" : "not done after 5 s");
+		}
+	}
 	redwood_status(REDWOOD_STATUS_GPU, "probing (a610=%u)", steps);
 	printf("a610: step 1: the GPU's clocks in the global clock controller (%#lx)\n", GCC_PHYS);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
@@ -439,6 +468,15 @@ a610_thread(void *parameter, __unused wait_result_t result)
 		redwood_status(REDWOOD_STATUS_GPU, "FAILED at step 4: CX does not come on");
 		goto out;
 	}
+	/*
+	 * Linux (kgsl) has CX's power switch on before it enables these, and before it they did not run
+	 * even with the RPM's buses asked for: so once more, now that CX is on. bimc_gpu_axi has no
+	 * status to go by (BRANCH_HALT_DELAY in gcc-sm6125.c); memnoc_gfx and snoc_dvm_gfx do.
+	 */
+	delay_for_interval(100, NSEC_PER_USEC);
+	(void)clock_on("gcc_gpu_memnoc_gfx_clk, with CX on", gcc, 0x3600c, true);
+	(void)clock_on("gcc_gpu_snoc_dvm_gfx_clk, with CX on", gcc, 0x36018, true);
+	(void)clock_on("gcc_bimc_gpu_axi_clk, with CX on", gcc, 0x71154, false);
 	/* the GMU wrapper's clock: the vendor's wake and sleep counts (0xf each) before it is switched on */
 	wr(gpucc + 0x1098, (rd(gpucc + 0x1098) & ~0xff0u) | 0xf << 8 | 0xf << 4);
 	if (!clock_on("gpu_cc_ahb_clk", gpucc, 0x1078, true) || !clock_on("gpu_cc_cxo_clk", gpucc, 0x109c, true) ||
@@ -680,13 +718,72 @@ step10:
 		static const uint32_t address_modes[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
 			                                  0x0e00, 0xae01, 0xb601, 0xf810 };
 
+		/*
+		 * The bus interface out of halt, both of its halves (Linux's hw_init, a6xx_has_gbif): while it is
+		 * halted nothing of the core reaches memory, and a command processor waiting for its microcode
+		 * or its ring says nothing about it.
+		 */
+		uint32_t bypass = 0;
+
+		PE_parse_boot_argn("a610_bypass", &bypass, sizeof(bypass));
+		if (bypass && smmu != 0) {
+			/*
+			 * SMMU v2: S2CR TYPE [17:16] (0 translate, 1 bypass), CBNDX [7:0]; SMR VALID [31], MASK [30:16],
+			 * ID [14:0]. A bypass S2CR (the first try) came back as "fault" and the SMR not taken: Qualcomm's
+			 * hypervisor does not allow bypass. Linux's way round it (arm-smmu-qcom.c, bypass_quirk): the
+			 * last context, of type "stage 1 translation, stage 2 bypass" with its translation off
+			 * (SCTLR 0), and the streams sent to it as to any context.
+			 */
+			uint32_t cb = 4;
+			vm_offset_t cbase = smmu + 0x8000 + 0x1000 * cb;
+
+			printf("a610: SMMU stream 0 before: SMR %#x, S2CR %#x; context %u: CBAR %#x, SCTLR %#x; sCR0 %#x\n",
+			    rd(smmu + 0x800), rd(smmu + 0xc00), cb, rd(smmu + 0x1000 + 4 * cb), rd(cbase), rd(smmu + 0x0));
+			wr(cbase + 0x00, 0);                            /* SCTLR: translation off */
+			wr(cbase + 0x58, rd(cbase + 0x58));             /* FSR: clear what is there */
+			wr(smmu + 0x1800 + 4 * cb, 1);                  /* CBA2R: 64-bit */
+			wr(smmu + 0x1000 + 4 * cb, 1u << 16);           /* CBAR: S1 translation, S2 bypass */
+			wr(smmu + 0xc00, cb);                           /* S2CR: translate, context 4 */
+			/*
+			 * SMR: SIDs 0-3 (mask 3) was not taken, the rest was -- SID 2 is the secure stream, not the
+			 * HLOS's. So the device tree's own gfx3d_user (SID 0 mask 1), then SID 0 alone.
+			 */
+			{
+				static const uint32_t smrs[] = { 1u << 31 | 1u << 16 | 0, 1u << 31 | 0 };
+
+				for (unsigned i = 0; i < 2; i++) {
+					wr(smmu + 0x800, smrs[i]);
+					__builtin_arm_dsb(0xf);
+					printf("a610: SMMU SMR 0 = %#x: reads %#x (%s)\n", smrs[i], rd(smmu + 0x800),
+					    rd(smmu + 0x800) == smrs[i] ? "taken" : "NOT taken");
+					if (rd(smmu + 0x800) == smrs[i]) {
+						break;
+					}
+				}
+			}
+			printf("a610: SMMU stream 0 after: SMR %#x, S2CR %#x; context %u: CBAR %#x, CBA2R %#x, SCTLR %#x (%s); sGFSR %#x\n",
+			    rd(smmu + 0x800), rd(smmu + 0xc00), cb, rd(smmu + 0x1000 + 4 * cb), rd(smmu + 0x1800 + 4 * cb), rd(cbase),
+			    (rd(smmu + 0x800) >> 31) && (rd(smmu + 0xc00) & 0x300ff) == cb ?
+			    "the GPU's stream to a context that does not translate" : "the SMMU did NOT take it", rd(smmu + 0x48));
+		}
+		printf("a610: bus interface before: GBIF halt %#x (ack %#x), RBBM's halt %#x (ack %#x)\n", rd(gpu + GBIF_HALT),
+		    rd(gpu + GBIF_HALT_ACK), rd(gpu + RBBM_GBIF_HALT), rd(gpu + RBBM_GBIF_HALT_ACK));
+		wr(gpu + GBIF_HALT, 0);
+		(void)rd(gpu + GBIF_HALT);
 		wr(gpu + RBBM_GBIF_HALT, 0);
+		(void)rd(gpu + RBBM_GBIF_HALT);
+		printf("a610: bus interface after: GBIF halt %#x (ack %#x), RBBM's halt %#x (ack %#x)\n", rd(gpu + GBIF_HALT),
+		    rd(gpu + GBIF_HALT_ACK), rd(gpu + RBBM_GBIF_HALT), rd(gpu + RBBM_GBIF_HALT_ACK));
 		wr(gpu + RBBM_SECVID_TSB_CNTL, 0);
 		put64(gpu + RBBM_SECVID_TSB_TRUSTED_BASE, 0);
 		wr(gpu + RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
 		for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
 			wr(gpu + GPU_WORD(address_modes[i]), 1);        /* 64-bit addresses */
 		}
+		for (unsigned i = 0; i < 4; i++) {
+			wr(gpu + GBIF_QSB_SIDE0 + 4 * i, 0x00071620);
+		}
+		wr(gpu + RBBM_GBIF_CLIENT_QOS_CNTL, 3);
 		wr(gpu + RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
 		put64(gpu + UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
 		put64(gpu + UCHE_TRAP_BASE, 0x0001fffffffff000ull);
@@ -701,6 +798,8 @@ step10:
 		wr(gpu + PC_DBG_ECO_CNTL, 0x00080000);
 		wr(gpu + CP_AHB_CNTL, 1);
 		wr(gpu + RBBM_PERFCTR_CNTL, 1);
+		wr(gpu + RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x3ffff);    /* the A610's */
+		wr(gpu + UCHE_CLIENT_PF, 1u << 7 | 1);
 		put64(gpu + CP_SQE_INSTR_BASE, core_phys + CORE_SQE_OFFSET);
 		put64(gpu + CP_RB_BASE, core_phys);
 		wr(gpu + CP_RB_CNTL, CP_RB_CNTL_VALUE);
@@ -734,32 +833,46 @@ step10:
 		goto out;
 	}
 
-	printf("a610: step 12: out of secure mode by register, then a word written on command\n");
-	redwood_status(REDWOOD_STATUS_GPU, "step 12: secure mode, first write");
+	printf("a610: step 12: a word written on command, in secure mode and then out of it by packet\n");
+	redwood_status(REDWOOD_STATUS_GPU, "step 12: first write");
 	{
 		volatile uint32_t *page = (volatile uint32_t *)(core_memory + CORE_SCRATCH_OFFSET);
 		uint64_t target = core_phys + CORE_SCRATCH_OFFSET;
+		static const uint32_t words[] = { 0x600dc0de, 0x600dc0d1 };
+		bool wrote = false;
 
-		printf("a610: RBBM_SECVID_TRUST_CNTL was %#x\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
-		wr(gpu + RBBM_SECVID_TRUST_CNTL, 0);
-		printf("a610: RBBM_SECVID_TRUST_CNTL is %#x after writing 0\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
-		page[0] = 0;
-		to_memory((vm_offset_t)page, 64);
-		ring_command(CP_MEM_WRITE, 3);
-		ring((uint32_t)target);
-		ring((uint32_t)(target >> 32));
-		ring(0x600dc0de);
-		if (!ring_run("write a word to memory")) {
+		printf("a610: RBBM_SECVID_TRUST_CNTL is %#x (not written: that hangs the bus here)\n",
+		    rd(gpu + RBBM_SECVID_TRUST_CNTL));
+		for (unsigned i = 0; i < 2 && !wrote; i++) {
+			if (i == 1) {
+				ring_command(CP_SET_SECURE_MODE, 1);
+				ring(0);
+				if (!ring_run("leave secure mode (CP_SET_SECURE_MODE 0)")) {
+					smmu_faults("after CP_SET_SECURE_MODE");
+					redwood_status(REDWOOD_STATUS_GPU, "FAILED 12: CP_SET_SECURE_MODE 0 does not go through");
+					goto out;
+				}
+				printf("a610: RBBM_SECVID_TRUST_CNTL is %#x after it\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
+			}
+			page[0] = 0;
+			to_memory((vm_offset_t)page, 64);
+			ring_command(CP_MEM_WRITE, 3);
+			ring((uint32_t)target);
+			ring((uint32_t)(target >> 32));
+			ring(words[i]);
+			if (!ring_run(i == 0 ? "write a word to memory, in secure mode" : "write a word to memory, out of it")) {
+				smmu_faults("after the write");
+				redwood_status(REDWOOD_STATUS_GPU, "FAILED 12: write %u does not go through", i + 1);
+				goto out;
+			}
+			to_memory((vm_offset_t)page, 64);
+			wrote = page[0] == words[i];
+			printf("a610: the page reads %#x: %s\n", page[0], wrote ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" :
+			    "not what it was told to write");
 			smmu_faults("after the write");
-			redwood_status(REDWOOD_STATUS_GPU, "FAILED 12: the write does not go through");
-			goto out;
 		}
-		to_memory((vm_offset_t)page, 64);
-		printf("a610: the page reads %#x: %s\n", page[0], page[0] == 0x600dc0de ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" :
-		    "not what it was told to write");
-		smmu_faults("at the end");
-		redwood_status(REDWOOD_STATUS_GPU, page[0] == 0x600dc0de ? "GPU RUNS COMMANDS and writes memory" :
-		    "FAILED 12: page reads %#x", page[0]);
+		redwood_status(REDWOOD_STATUS_GPU, wrote ? "GPU RUNS COMMANDS and writes memory" : "FAILED 12: page reads %#x",
+		    page[0]);
 	}
 out:
 	printf("a610: stopping after step %u (a610=%u)\n", steps < 12 ? steps : 12, steps);

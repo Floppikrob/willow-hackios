@@ -80,6 +80,7 @@ enum { REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_CPU, REDWOOD_STATUS_MEMORY, REDWOOD
        REDWOOD_STATUS_PARTS };
 void redwood_status(unsigned part, const char *format, ...) __printflike(2, 3);
 bool redwood_status_line(unsigned part, char *line, size_t size);
+void redwood_rpm_init(void);           /* boot-arg rpm=N with device=willow: the RPM's request channel, steps 1 to N */
 void redwood_a610_init(void);          /* boot-arg a610=N with device=willow: the same for the Note 8T's Adreno 610 */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
