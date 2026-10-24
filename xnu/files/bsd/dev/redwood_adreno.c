@@ -3126,9 +3126,12 @@ gpu_block_stop(void)
  * end of a run, a panic). Only the two writes that keep the GMU out of memory that is no longer
  * its to use.
  */
+extern void a610_gpu_quiesce(void);     /* the willow's (redwood_a610.c): its context 0 off, if it was kept */
+
 void
 redwood_adreno_quiesce(void)
 {
+	a610_gpu_quiesce();
 	if (cx_off) {
 		return;
 	}
@@ -3284,6 +3287,36 @@ extern void RedwoodGPUStop(void);       /* takes the clients' lock, then calls r
 static void gpu_block_stop(void);
 
 /*
+ * The willow's Adreno 610 (bsd/dev/redwood_a610.c, a610_keep=1) behind the same service: while
+ * a610_kept is set, what touches the GPU is asked of that file, and the rest -- the addresses
+ * handed out, the boot-args gpu_* -- stays here. redwood_gpu_keep() is how it starts that.
+ */
+extern bool a610_kept;
+extern bool a610_gpu_parameter(uint32_t which, uint64_t *value);
+extern bool a610_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+extern void a610_gpu_mapped(void);
+extern void a610_gpu_unmap(uint64_t address, uint64_t size);
+extern bool a610_gpu_done(uint32_t fence);
+extern uint32_t a610_gpu_last(void);
+extern void a610_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
+extern uint32_t a610_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+extern void a610_gpu_report(const char *why);
+extern void a610_gpu_stop(void);
+extern void a610_gpu_quiesce(void);
+
+void redwood_gpu_keep(void);
+void
+redwood_gpu_keep(void)
+{
+	gpu_free[0].start = GPU_ADDRESSES_START;
+	gpu_free[0].size = GPU_ADDRESSES_SIZE;
+	gpu_free_count = 1;
+	PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
+	PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+	PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
+}
+
+/*
  * A run that ends in order -- its time is up, the host asks for the end, five fingers on the
  * screen, a halt: whoever is about to call loader_return() for one of these calls
  * redwood_adreno_stop() first, from a thread that may wait -- gives the GPU back as the steps'
@@ -3295,6 +3328,10 @@ static void gpu_block_stop(void);
 void
 redwood_gpu_stop(void)
 {
+	if (a610_kept) {
+		a610_gpu_stop();
+		return;
+	}
 	if (gpu_kept) {
 		uint32_t waited = 0;
 
@@ -3321,7 +3358,7 @@ redwood_adreno_stop(void)
 {
 	uint32_t dirty = 0;
 
-	if (gpu_kept && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
+	if ((gpu_kept || a610_kept) && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
 		RedwoodGPUStop();
 	}
 }
@@ -3329,13 +3366,16 @@ redwood_adreno_stop(void)
 bool
 redwood_gpu_ready(void)
 {
-	return gpu_kept;
+	return gpu_kept || a610_kept;
 }
 
 /* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */
 bool
 redwood_gpu_parameter(uint32_t which, uint64_t *value)
 {
+	if (a610_kept && a610_gpu_parameter(which, value)) {
+		return true;
+	}
 	switch (which) {
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
 	case 0x06:                              /* GMEM_BASE */
@@ -3479,19 +3519,32 @@ redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *h
 bool
 redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
+	if (a610_kept) {
+		return a610_gpu_map(address, phys, read_only);
+	}
 	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
 }
 
 void
 redwood_gpu_mapped(void)
 {
+	if (a610_kept) {
+		a610_gpu_mapped();
+		return;
+	}
 	space_commit(&core_space);
 }
 
 void
 redwood_gpu_unmap(uint64_t address, uint64_t size)
 {
-	uint32_t context = smmu_context(&core_space);
+	uint32_t context;
+
+	if (a610_kept) {
+		a610_gpu_unmap(address, size);
+		return;
+	}
+	context = smmu_context(&core_space);
 
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
 		space_map(&core_space, address + offset, 0, 0);
@@ -3516,6 +3569,10 @@ redwood_gpu_done(uint32_t fence)
 {
 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 
+	if (a610_kept) {
+		return a610_gpu_done(fence);
+	}
+
 	to_memory((vm_offset_t)word, 4);
 	return (int32_t)(*word - fence) >= 0;
 }
@@ -3523,7 +3580,7 @@ redwood_gpu_done(uint32_t fence)
 uint32_t
 redwood_gpu_last(void)
 {
-	return gpu_fence;
+	return a610_kept ? a610_gpu_last() : gpu_fence;
 }
 
 /* The core is to write down what time it is: at one end of submission `fence`. */
@@ -3578,6 +3635,10 @@ gpu_times(void)
 void
 redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
+	if (a610_kept) {
+		a610_gpu_worked(microseconds, submissions, by);
+		return;
+	}
 	gpu_times();
 	*microseconds = gpu_ticks * 10 / 192;
 	*submissions = gpu_timed_count;
@@ -3597,6 +3658,9 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
+	if (a610_kept) {
+		return a610_gpu_submit(addresses, words, count);
+	}
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
@@ -3640,7 +3704,13 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 void
 redwood_gpu_report(const char *why)
 {
-	uint32_t context = smmu_context(&core_space);
+	uint32_t context;
+
+	if (a610_kept) {
+		a610_gpu_report(why);
+		return;
+	}
+	context = smmu_context(&core_space);
 
 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
 	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x\n", why, gpu_fence,

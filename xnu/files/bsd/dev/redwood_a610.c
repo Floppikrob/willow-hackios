@@ -437,7 +437,8 @@ put64(vm_offset_t reg, uint64_t value)
 #define PTE_PAGE                3ull
 #define PTE_CORE                (1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)  /* unprivileged, shared, accessed, not global; uncached */
 #define PTE_ADDRESS             0x0000fffffffff000ull
-#define SPACE_TABLES            64              /* 64 tables of 512 pages: 128 MB, were they all of the last level */
+#define SPACE_TABLES            1024            /* 2 GB of addresses, were they all of the last level (as redwood_adreno.c) */
+#define PTE_READ_ONLY           (1ull << 7)     /* Linux gives the core its microcode so (MSM_BO_GPU_READONLY) */
 #define SMMU_CB_TCR2            0x10
 #define SMMU_CB_TTBR0           0x20
 #define SMMU_CB_TTBR1           0x28
@@ -462,7 +463,28 @@ static struct {
 	uint32_t count;
 	uint64_t *table[SPACE_TABLES];
 	uint64_t phys[SPACE_TABLES];
+	bool changed[SPACE_TABLES];             /* to be written out of this processor's cache (space_commit()) */
+	uint64_t *last_entry, *last_table;      /* the level-2 entry looked up last, and its table: a buffer's pages in a row */
 } space;
+
+/* The table an entry of ours is in has changed. */
+static void
+space_changed(const uint64_t *entry)
+{
+	static uint32_t last;                   /* (a buffer's pages are in one table after another) */
+
+	if (last < space.count && entry >= space.table[last] && entry < space.table[last] + 512) {
+		space.changed[last] = true;
+		return;
+	}
+	for (uint32_t i = 0; i < space.count; i++) {
+		if (entry >= space.table[i] && entry < space.table[i] + 512) {
+			space.changed[i] = true;
+			last = i;
+			return;
+		}
+	}
+}
 
 static uint64_t *
 space_table(uint64_t *entry)
@@ -484,28 +506,57 @@ space_table(uint64_t *entry)
 	}
 	table = (uint64_t *)page;       /* a 4K table at the start of a page of ours (16K pages hold four; one is enough) */
 	space.table[space.count] = table;
+	space.changed[space.count] = true;
 	space.phys[space.count++] = kvtophys(page);
 	if (entry != NULL) {
 		*entry = kvtophys(page) | PTE_TABLE;
+		space_changed(entry);
 	}
 	return table;
 }
 
-/* One 4K page of the core's addresses to one of ours. */
+/* One 4K page of the core's addresses to one of ours, with these attributes (0 and 0: no page there). */
 static bool
-space_map(uint64_t address, uint64_t phys)
+space_map_as(uint64_t address, uint64_t phys, uint64_t attributes)
 {
 	uint64_t *level2, *level3;
 
-	if (space.count == 0 && space_table(NULL) == NULL) {
+	if (address >> 39 || (space.count == 0 && space_table(NULL) == NULL)) {
 		return false;
 	}
-	if ((level2 = space_table(&space.table[0][address >> 30 & 0x1ff])) == NULL ||
-	    (level3 = space_table(&level2[address >> 21 & 0x1ff])) == NULL) {
+	if ((level2 = space_table(&space.table[0][address >> 30 & 0x1ff])) == NULL) {
 		return false;
 	}
-	level3[address >> 12 & 0x1ff] = phys | PTE_CORE | PTE_PAGE;
+	if (space.last_entry == &level2[address >> 21 & 0x1ff]) {
+		level3 = space.last_table;
+	} else if ((level3 = space_table(&level2[address >> 21 & 0x1ff])) != NULL) {
+		space.last_entry = &level2[address >> 21 & 0x1ff];
+		space.last_table = level3;
+	} else {
+		space.last_entry = NULL;
+		return false;
+	}
+	level3[address >> 12 & 0x1ff] = phys == 0 && attributes == 0 ? 0 : phys | attributes | PTE_PAGE;
+	space_changed(&level3[address >> 12 & 0x1ff]);
 	return true;
+}
+
+static bool
+space_map(uint64_t address, uint64_t phys)
+{
+	return space_map_as(address, phys, PTE_CORE);
+}
+
+/* The tables that have changed, out of this processor's cache to where the SMMU reads them. */
+static void
+space_commit(void)
+{
+	for (uint32_t i = 0; i < space.count; i++) {
+		if (space.changed[i]) {
+			to_memory((vm_offset_t)space.table[i], 4096);
+			space.changed[i] = false;
+		}
+	}
 }
 
 /* Memory of ours, `size` bytes of pages, at an address of the core's. */
@@ -584,11 +635,31 @@ odd_parity(uint32_t v)
 	return 0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1;
 }
 
+static uint32_t *emit_to, emit_count;    /* set: what ring() is given goes into a command buffer instead */
+
 static void
 ring(uint32_t word)
 {
+	if (emit_to != NULL) {
+		emit_to[emit_count++] = word;
+		return;
+	}
 	((uint32_t *)core_memory)[ring_at] = word;
 	ring_at = (ring_at + 1) % RING_WORDS;
+}
+
+/* What has been put into the ring since the last time, out to memory and to the core; no waiting. */
+static void
+ring_send(void)
+{
+	if (ring_at >= ring_sent) {
+		to_memory(core_memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
+	} else {
+		to_memory(core_memory + 4 * ring_sent, 4 * (RING_WORDS - ring_sent));
+		to_memory(core_memory, 4 * ring_at);
+	}
+	ring_sent = ring_at;
+	wr(gpu + CP_RB_WPTR, ring_at);
 }
 
 static void
@@ -640,7 +711,7 @@ ring_register(uint32_t number, uint32_t value)
 extern void MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes);
 
 static void
-ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue)
+ring_fill_at(uint64_t target, uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue)
 {
 	ring_register(GRAS_2D_DST_TL, top << 16);
 	ring_register(GRAS_2D_DST_BR, (PICTURE_WIDTH - 1) | (bottom - 1) << 16);
@@ -653,12 +724,18 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	ring_register(SP_2D_DST_FORMAT, 1 | FORMAT_8888 << 3 | 0xfu << 12);
 	ring_register(RB_2D_PIXEL_CNTL, 0);
 	ring_register(RB_2D_DST_INFO, DST_BGRA_LINEAR);
-	ring_register(RB_2D_DST, (uint32_t)TARGET_ADDRESS);
-	ring_register(RB_2D_DST + 1, (uint32_t)(TARGET_ADDRESS >> 32));
+	ring_register(RB_2D_DST, (uint32_t)target);
+	ring_register(RB_2D_DST + 1, (uint32_t)(target >> 32));
 	ring_register(RB_2D_DST_PITCH, PICTURE_ROW >> 6);
 	ring_command(CP_WAIT_FOR_IDLE, 0);
 	ring_command(CP_BLIT, 1);
 	ring(3);                                /* "scale": the 2D engine's one operation */
+}
+
+static void
+ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue)
+{
+	ring_fill_at(TARGET_ADDRESS, top, bottom, red, green, blue);
 }
 
 /* Let the core have what is in the ring, and wait until it has taken all of it and rests. */
@@ -668,9 +745,7 @@ ring_run(const char *what)
 	uint32_t taken = ~0u, status = ~0u;
 
 	printf("a610: about to have the 3D core %s: the ring up to word %u\n", what, ring_at);
-	to_memory(core_memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
-	ring_sent = ring_at;
-	wr(gpu + CP_RB_WPTR, ring_at);
+	ring_send();
 	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
 		delay_for_interval(100, NSEC_PER_USEC);
 		taken = rd(gpu + CP_RB_RPTR);
@@ -924,13 +999,389 @@ zap_load(const uint8_t *header, uint32_t segments)
 	redwood_status(REDWOOD_STATUS_GPU, "zap shader IN");
 }
 
+/*
+ * ---- the GPU kept on, for the system to draw with (a610_keep=1) ----
+ *
+ * As redwood_adreno.c's "GPU kept on": once the steps have the core out of secure mode and
+ * writing memory through our tables (a610=12 or 13, a610_zap=1, a610_smmu=1), it is left so,
+ * and the service RedwoodGPU (iokit/Kernel/RedwoodGPU.cpp) hands it to programs through the
+ * interface of Linux's msm driver. redwood_adreno.c keeps what is not the GPU's -- the addresses
+ * handed out, the boot-args gpu_* -- and asks here for the rest while a610_kept is set: the
+ * parameters that are the A610's, pages entered into context 0, submissions and how far the
+ * core has got. The caller holds one lock around all of these.
+ *
+ * A submission is what Linux's a6xx_submit puts in the ring, as redwood_adreno.c's: the time,
+ * the colour and depth caches invalidated, the program's command buffers (CP_INDIRECT_BUFFER),
+ * the time again, and its number written to the scratch page once the caches are in memory.
+ *
+ * a610_selftest=1: before the service starts, the picture of step 13 once more, but made the
+ * way a program has it made -- addresses from redwood_gpu_address(), pages entered one by one,
+ * the commands in a command buffer of their own, and a submission waited for by its number.
+ */
+#define GPU_CHIP_ID_A610        0x06010000ull   /* Linux's adreno_device.c, Mesa's freedreno_devices.py */
+#define GPU_GMEM_A610           (128u * 1024 + 4096)    /* adreno_device.c: SZ_128K + SZ_4K */
+#define KEPT_FENCE_AT           0x40            /* in the scratch page */
+#define KEPT_TIMES_AT           0x400           /* ... and when the core began and ended its last submissions */
+#define KEPT_TIMES              64
+#define CP_ALWAYS_ON_COUNTER    0x0980          /* ticks of the 19.2 MHz crystal, 64 bits */
+#define CP_REG_TO_MEM           0x3e
+#define CP_INDIRECT_BUFFER      0x3f
+#define CP_SCRATCH_REG2         0x0885
+#define CP_IB1_BASE             GPU_WORD(0x0928)
+#define CP_IB1_REM_SIZE         GPU_WORD(0x092a)
+#define EVENT_INVALIDATE_DEPTH  0x18
+#define EVENT_INVALIDATE_COLOR  0x19
+
+bool a610_kept;
+static uint32_t kept_fence, kept_timed, kept_timed_count, kept_timed_by[7];
+static uint64_t kept_ticks;
+
+extern uint64_t redwood_gpu_address(uint64_t size);
+extern void redwood_gpu_keep(void);
+extern void RedwoodGPUStart(void);
+
+static vm_offset_t
+kept_scratch(void)
+{
+	return core_memory + CORE_SCRATCH_OFFSET;
+}
+
+/* The answers to msm's GET_PARAM that are the A610's; the rest are redwood_adreno.c's (false here). */
+bool
+a610_gpu_parameter(uint32_t which, uint64_t *value)
+{
+	switch (which) {
+	case 0x02:                              /* GMEM_SIZE */
+		*value = GPU_GMEM_A610;
+		return true;
+	case 0x03:                              /* CHIP_ID */
+		*value = GPU_CHIP_ID_A610;
+		return true;
+	case 0x04:                              /* MAX_FREQ */
+		*value = (core_mhz ? core_mhz : 19) * 1000000ull;
+		return true;
+	case 0x10:                              /* HIGHEST_BANK_BIT: a6xx_calc_ubwc_config for the A610 */
+		*value = 13;
+		return true;
+	case 0x12:                              /* UBWC_SWIZZLE */
+		*value = 7;
+		return true;
+	case 0x13:                              /* MACROTILE_MODE */
+		*value = 0;
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool
+a610_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+{
+	return space_map_as(address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+}
+
+void
+a610_gpu_mapped(void)
+{
+	space_commit();
+}
+
+void
+a610_gpu_unmap(uint64_t address, uint64_t size)
+{
+	vm_offset_t cb = smmu + 0x8000;
+
+	for (uint64_t offset = 0; offset < size; offset += 4096) {
+		space_map_as(address + offset, 0, 0);
+	}
+	space_commit();
+	wr(cb + SMMU_CB_TLBIASID, 0);
+	wr(cb + SMMU_CB_TLBSYNC, 1);
+	for (int i = 0; i < 1000 && (rd(cb + SMMU_CB_TLBSTATUS) & 1); i++) {
+	}
+}
+
+bool
+a610_gpu_done(uint32_t fence)
+{
+	volatile uint32_t *word = (volatile uint32_t *)(kept_scratch() + KEPT_FENCE_AT);
+
+	to_memory((vm_offset_t)word, 4);
+	return (int32_t)(*word - fence) >= 0;
+}
+
+uint32_t
+a610_gpu_last(void)
+{
+	return kept_fence;
+}
+
+/* The core is to write down what time it is: at one end of submission `fence`. */
+static void
+kept_time(uint32_t fence, uint32_t end)
+{
+	uint64_t at = core_address + CORE_SCRATCH_OFFSET + KEPT_TIMES_AT + 16 * (fence % KEPT_TIMES) + 8 * end;
+
+	ring_command(CP_REG_TO_MEM, 3);
+	ring(CP_ALWAYS_ON_COUNTER | 2u << 18 | 1u << 30);       /* two words, a 64-bit register */
+	ring((uint32_t)at);
+	ring((uint32_t)(at >> 32));
+}
+
+/* Add up the times of the submissions the core has finished since this was last done (redwood_adreno.c's gpu_times). */
+static void
+kept_times(void)
+{
+	volatile uint64_t *times = (volatile uint64_t *)(kept_scratch() + KEPT_TIMES_AT);
+	uint32_t done;
+
+	to_memory(kept_scratch(), 4096);
+	done = *(volatile uint32_t *)(kept_scratch() + KEPT_FENCE_AT);
+	if (done - kept_timed > KEPT_TIMES) {
+		kept_timed = done - KEPT_TIMES;
+	}
+	while (kept_timed != done) {
+		uint32_t slot = ++kept_timed % KEPT_TIMES;
+
+		if (kept_timed != 0 && times[2 * slot + 1] > times[2 * slot]) {
+			static const uint32_t under[6] = { 1920, 4800, 9600, 19200, 38400, 76800 };
+			uint64_t ticks = times[2 * slot + 1] - times[2 * slot];
+			unsigned by = 0;
+
+			while (by < 6 && ticks >= under[by]) {
+				by++;
+			}
+			kept_timed_by[by]++;
+			kept_ticks += ticks;
+			kept_timed_count++;
+		}
+	}
+}
+
+void
+a610_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+{
+	kept_times();
+	*microseconds = kept_ticks * 10 / 192;
+	*submissions = kept_timed_count;
+	memcpy(by, kept_timed_by, sizeof(kept_timed_by));
+	bzero(kept_timed_by, sizeof(kept_timed_by));
+	kept_ticks = 0;
+	kept_timed_count = 0;
+}
+
+/* Command buffers for the core to run, in order: each an address and a count of words. 0: the ring stays full. */
+uint32_t
+a610_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	uint32_t wanted = 30 + 4 * count, room = 0;
+	uint64_t fence_at = core_address + CORE_SCRATCH_OFFSET + KEPT_FENCE_AT;
+
+	for (int i = 0; i < 20000; i++) {
+		room = (rd(gpu + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
+		if (room >= wanted) {
+			break;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	if (room < wanted) {
+		return 0;
+	}
+	kept_times();
+	if (++kept_fence == 0) {
+		kept_fence = 1;
+	}
+	kept_time(kept_fence, 0);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_INVALIDATE_DEPTH);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_INVALIDATE_COLOR);
+	for (uint32_t i = 0; i < count; i++) {
+		ring_command(CP_INDIRECT_BUFFER, 3);
+		ring((uint32_t)addresses[i]);
+		ring((uint32_t)(addresses[i] >> 32));
+		ring(words[i]);
+	}
+	ring_command(CP_WAIT_FOR_IDLE, 0);
+	kept_time(kept_fence, 1);
+	ring_register(CP_SCRATCH_REG2, kept_fence);
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_CACHE_FLUSH);
+	ring((uint32_t)fence_at);
+	ring((uint32_t)(fence_at >> 32));
+	ring(kept_fence);
+	ring_send();
+	return kept_fence;
+}
+
+void
+a610_gpu_report(const char *why)
+{
+	printf("a610: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
+	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x; in a command buffer at %#llx, "
+	    "%u words to go\n", why, kept_fence, *(volatile uint32_t *)(kept_scratch() + KEPT_FENCE_AT), rd(gpu + CP_RB_RPTR),
+	    ring_at, rd(gpu + RBBM_STATUS), rd(gpu + RBBM_INT_0_STATUS), rd(gpu + CP_HW_FAULT), rd(gpu + CP_INTERRUPT_STATUS),
+	    rd(gpu + CP_PROTECT_STATUS), (uint64_t)rd(gpu + CP_IB1_BASE + 4) << 32 | rd(gpu + CP_IB1_BASE),
+	    rd(gpu + CP_IB1_REM_SIZE));
+	(void)space_faulted("the submission");
+}
+
+/*
+ * The run ends (redwood_gpu_stop(), from RedwoodGPUStop()): what the core was given it finishes
+ * (half a second at most); then its command processor is stopped and context 0 switched off, so
+ * that nothing of the GPU reads this kernel's memory any more.
+ */
+void
+a610_gpu_quiesce(void)
+{
+	if (!a610_kept) {
+		return;
+	}
+	a610_kept = false;
+	wr(gpu + CP_SQE_CNTL, 0);
+	wr(smmu + 0x8000, 0);                   /* context 0's SCTLR */
+	wr(smmu + 0x800, 0);                    /* SMR 0: the GPU's stream matched no more */
+}
+
+void
+a610_gpu_stop(void)
+{
+	uint32_t waited = 0;
+
+	if (!a610_kept) {
+		return;
+	}
+	while (!a610_gpu_done(kept_fence) && waited < 5000) {
+		delay_for_interval(100, NSEC_PER_USEC);
+		waited++;
+	}
+	printf("a610: the run is about to end: the GPU is given back (%s after %u us)\n",
+	    a610_gpu_done(kept_fence) ? "it had finished what it was given" : "STILL AT WORK", 100 * waited);
+	a610_gpu_quiesce();
+}
+
+/* Pages of ours, kernel memory, at addresses the allocator gives (a buffer as RedwoodGPU makes one). */
+static uint64_t
+kept_buffer(vm_offset_t *memory, uint32_t size)
+{
+	uint64_t address;
+
+	if (kmem_alloc(kernel_map, memory, round_page(size), KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS || (address = redwood_gpu_address(size)) == 0) {
+		return 0;
+	}
+	for (uint32_t offset = 0; offset < size; offset += 4096) {
+		if (!a610_gpu_map(address + offset, kvtophys(*memory + offset), false)) {
+			return 0;
+		}
+	}
+	a610_gpu_mapped();
+	return address;
+}
+
+static const uint32_t gen1_magic[][2] = {
+	/* Mesa's a6xx_gen1_low_raw_magic_regs, the A610's */
+	{ 0x9804, 0xf }, { 0x9805, 0 }, { 0xa0f8, 0 }, { 0xb600, 0 }, { 0x8600, 0 }, { 0xae03, 0 }, { 0xae00, 0 },
+	{ 0xbe04, 0 }, { 0x9600, 0 }, { 0x0e12, 0x10000000 }, { 0x8e01, 0x1 }, { 0x8e04, 0x04100000 },
+};
+
+static void
+kept_selftest(void)
+{
+	vm_offset_t picture, commands;
+	uint64_t picture_at, commands_at, began, ended, ns;
+	uint32_t size = PICTURE_ROW * PICTURE_HEIGHT, fence, count;
+	const volatile uint8_t *pixel;
+	bool done = false;
+
+	printf("a610: self-test: the picture of step 13 as a program would have it drawn\n");
+	if ((picture_at = kept_buffer(&picture, size)) == 0 || (commands_at = kept_buffer(&commands, 16384)) == 0) {
+		printf("a610: self-test: no buffers\n");
+		return;
+	}
+	to_memory(picture, size);
+	emit_to = (uint32_t *)commands;
+	emit_count = 0;
+	for (unsigned i = 0; i < sizeof(gen1_magic) / sizeof(gen1_magic[0]); i++) {
+		ring_register(gen1_magic[i][0], gen1_magic[i][1]);
+	}
+	ring_command(CP_SET_MARKER, 1);
+	ring(12);
+	ring_register(RB_CCU_CNTL, A610_CCU_CNTL_BYPASS | 1);
+	ring_fill_at(picture_at, 0, 780, 0, 160, 0);                    /* green */
+	ring_fill_at(picture_at, 780, 1560, 255, 255, 255);
+	ring_fill_at(picture_at, 1560, PICTURE_HEIGHT, 255, 0, 160);    /* pink */
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_FLUSH_COLOR);
+	ring((uint32_t)(core_address + CORE_SCRATCH_OFFSET + 32));
+	ring((uint32_t)((core_address + CORE_SCRATCH_OFFSET + 32) >> 32));
+	ring(0x5e1f7e57);
+	count = emit_count;
+	emit_to = NULL;
+	to_memory(commands, 4 * count);
+	printf("a610: self-test: the picture at %#llx, %u words of commands at %#llx; the tables: %u\n", picture_at, count,
+	    commands_at, space.count);
+	began = mach_absolute_time();
+	fence = a610_gpu_submit(&commands_at, &count, 1);
+	for (int i = 0; fence != 0 && i < 20000 && !(done = a610_gpu_done(fence)); i++) {
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	ended = mach_absolute_time();
+	absolutetime_to_nanoseconds(ended - began, &ns);
+	if (!done) {
+		a610_gpu_report("self-test");
+		redwood_status(REDWOOD_STATUS_GPU, "self-test FAILED: submission %u not done", fence);
+		return;
+	}
+	to_memory(picture, size);
+	pixel = (const volatile uint8_t *)picture;
+	printf("a610: self-test: submission %u done in %llu us; first pixel %02x %02x %02x %02x (told 00 a0 00 ff), middle "
+	    "%02x %02x %02x %02x, last row %02x %02x %02x %02x (told a0 00 ff ff)\n", fence, ns / 1000, pixel[0], pixel[1],
+	    pixel[2], pixel[3], pixel[1170 * PICTURE_ROW + 2160], pixel[1170 * PICTURE_ROW + 2161],
+	    pixel[1170 * PICTURE_ROW + 2162], pixel[1170 * PICTURE_ROW + 2163], pixel[2339 * PICTURE_ROW + 4316],
+	    pixel[2339 * PICTURE_ROW + 4317], pixel[2339 * PICTURE_ROW + 4318], pixel[2339 * PICTURE_ROW + 4319]);
+	if (pixel[1] == 0xa0 && pixel[2339 * PICTURE_ROW + 4316] == 0xa0 && pixel[2339 * PICTURE_ROW + 4318] == 0xff) {
+		MiniIOMobileFramebufferShow((const uint8_t *)picture, PICTURE_WIDTH, PICTURE_HEIGHT, PICTURE_ROW);
+		printf("a610: SELF-TEST PASSED: a submission through a command buffer drew its picture (green, white, pink)\n");
+		redwood_status(REDWOOD_STATUS_GPU, "kept on; self-test DRAWN");
+	} else {
+		redwood_status(REDWOOD_STATUS_GPU, "kept on; self-test picture wrong");
+	}
+}
+
+/* At the end of the steps: the GPU kept on, if it is in a state for that and a610_keep=1 asks. */
+static void
+kept_start(bool good)
+{
+	uint32_t keep = 0, selftest = 0;
+
+	if (!PE_parse_boot_argn("a610_keep", &keep, sizeof(keep)) || !keep) {
+		return;
+	}
+	if (!good || !zap_loaded || core_address != CORE_ADDRESS) {
+		printf("a610: not kept: the core must take commands out of secure mode through our tables "
+		    "(a610=12 or more, a610_zap=1, a610_smmu=1)\n");
+		return;
+	}
+	bzero((void *)kept_scratch(), 4096);
+	to_memory(kept_scratch(), 4096);
+	redwood_gpu_keep();                     /* the addresses, and the gpu_* boot-args */
+	a610_kept = true;
+	printf("a610: THE GPU STAYS ON for the system to draw with: the service RedwoodGPU\n");
+	redwood_status(REDWOOD_STATUS_GPU, "kept on at %u MHz", core_mhz ? core_mhz : 19);
+	if (PE_parse_boot_argn("a610_selftest", &selftest, sizeof(selftest)) && selftest) {
+		kept_selftest();
+	}
+	RedwoodGPUStart();
+}
+
 extern volatile int redwood_rpm_done;
 
 static void
 a610_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter;
-	bool cx_on, cx_clocks;
+	bool cx_on, cx_clocks, core_good = false;
 
 	{
 		/* with rpm=N: the RPM's requests first (bsd/dev/redwood_rpm.c), the GPU's path to memory runs on its buses */
@@ -1466,6 +1917,7 @@ step10:
 		}
 		redwood_status(REDWOOD_STATUS_GPU, wrote ? "GPU RUNS COMMANDS and writes memory" : "FAILED 12: page reads %#x",
 		    page[0]);
+		core_good = wrote;
 		if (!wrote) {
 			goto out;
 		}
@@ -1505,10 +1957,6 @@ step10:
 		 * same once more -- in secure mode the colour units may write as the secure stream (SID 2),
 		 * which goes nowhere of ours.
 		 */
-		static const uint32_t magic[][2] = {
-			{ 0x9804, 0xf }, { 0x9805, 0 }, { 0xa0f8, 0 }, { 0xb600, 0 }, { 0x8600, 0 }, { 0xae03, 0 }, { 0xae00, 0 },
-			{ 0xbe04, 0 }, { 0x9600, 0 }, { 0x0e12, 0x10000000 }, { 0x8e01, 0x1 }, { 0x8e04, 0x04100000 },
-		};
 		bool drawn = false;
 
 		for (unsigned attempt = 0; attempt < 2 && !drawn; attempt++) {
@@ -1522,8 +1970,8 @@ step10:
 				}
 				printf("a610: RBBM_SECVID_TRUST_CNTL is %#x after it\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
 			}
-			for (unsigned i = 0; i < sizeof(magic) / sizeof(magic[0]); i++) {
-				ring_register(magic[i][0], magic[i][1]);
+			for (unsigned i = 0; i < sizeof(gen1_magic) / sizeof(gen1_magic[0]); i++) {
+				ring_register(gen1_magic[i][0], gen1_magic[i][1]);
 			}
 			ring_command(CP_SET_MARKER, 1);
 			ring(12);                               /* "2D blits follow" */
@@ -1546,6 +1994,7 @@ step10:
 			if (!ring_run(attempt == 0 && !zap_loaded ? "fill a picture, in secure mode" : "fill a picture, out of secure mode")) {
 				space_faulted("filling the picture");
 				redwood_status(REDWOOD_STATUS_GPU, "FAILED 13: the fill does not go through");
+				core_good = false;
 				goto out;
 			}
 			space_faulted("filling the picture");
@@ -1575,6 +2024,7 @@ step10:
 	}
 out:
 	printf("a610: stopping after step %u (a610=%u)\n", steps < 13 ? steps : 13, steps);
+	kept_start(core_good);
 	thread_terminate(current_thread());
 }
 
