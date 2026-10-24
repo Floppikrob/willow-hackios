@@ -57,6 +57,10 @@
  *              Linux does where there is no zap shader at all, hung the bus on this phone (the
  *              write never came back, and the whole kernel stopped some 15 s later): not done
  *
+ *  13  commands a picture filled with three bands of colour by the 2D engine and shows it on
+ *              the panel: only with a610_smmu=1, which (in step 11, instead of a610_bypass=1) gives
+ *              the core addresses of its own through page tables of ours in the SMMU's context 0
+ *
  * Steps 9 to 12 go one after the other whatever 9 says: TrustZone does not take the zap shader's
  * signature here (it answers "not supported", SMCCC's -1), and 12 is the way round it, if there is one.
  *
@@ -243,6 +247,7 @@ gdsc(const char *name, uint32_t offset)
 
 static vm_offset_t core_memory;         /* the ring, the microcode, the page: one piece */
 static uint64_t core_phys;
+static uint64_t core_address;           /* ... where the 3D core sees it: core_phys, or CORE_ADDRESS with a610_smmu=1 */
 static uint32_t ring_at, ring_sent;
 
 static void
@@ -259,6 +264,162 @@ put64(vm_offset_t reg, uint64_t value)
 {
 	wr(reg, (uint32_t)value);
 	wr(reg + 4, (uint32_t)(value >> 32));
+}
+
+/*
+ * ---- the 3D core's own addresses (a610_smmu=1) ----
+ *
+ * Context 0 of the GPU's SMMU with page tables of ours, as bsd/dev/redwood_adreno.c makes them
+ * for redwood: three levels of 4K pages, 39 bits (dt: qcom,use-3-lvl-tables), stage 1 with stage
+ * 2 bypassed, the GPU's stream (SID 0 mask 1, the one match the hypervisor takes) sent through
+ * it. The core then needs no memory in one piece: the picture of step 13 is 10 MB of pages.
+ * Formats: Linux drivers/iommu/io-pgtable-arm.c and arm-smmu.c.
+ */
+#define CORE_ADDRESS            0x01000000ull   /* the ring, the microcode, the page (redwood's CORE_RING_ADDRESS) */
+#define TARGET_ADDRESS          0x10000000ull   /* step 13's picture */
+#define PTE_TABLE               3ull
+#define PTE_PAGE                3ull
+#define PTE_CORE                (1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)  /* unprivileged, shared, accessed, not global; uncached */
+#define PTE_ADDRESS             0x0000fffffffff000ull
+#define SPACE_TABLES            64              /* 64 tables of 512 pages: 128 MB, were they all of the last level */
+#define SMMU_CB_TCR2            0x10
+#define SMMU_CB_TTBR0           0x20
+#define SMMU_CB_TTBR1           0x28
+#define SMMU_CB_TCR             0x30
+#define SMMU_CB_MAIR0           0x38
+#define SMMU_CB_MAIR1           0x3c
+#define SMMU_CB_FSR             0x58
+#define SMMU_CB_FAR             0x60
+#define SMMU_CB_FSYNR0          0x68
+#define SMMU_CB_TLBIASID        0x610
+#define SMMU_CB_TLBSYNC         0x7f0
+#define SMMU_CB_TLBSTATUS       0x7f4
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* stage 2 bypassed; our tables alone decide */
+#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
+#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)   /* 4K pages, cached walks, no TTBR1 */
+#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)       /* 36 bits of physical address, 16 of context tag */
+#define SMMU_MAIR0              0xf404ff44      /* Linux's: 0 uncached, 1 cached, 2 device */
+#define SMMU_FSR_ALL            0xc00001fe
+#define SMMU_GPU_SMR            (1u << 31 | 1u << 16 | 0)       /* dt gfx3d_user: SID 0 mask 1 */
+
+static struct {
+	uint32_t count;
+	uint64_t *table[SPACE_TABLES];
+	uint64_t phys[SPACE_TABLES];
+} space;
+
+static uint64_t *
+space_table(uint64_t *entry)
+{
+	uint64_t *table;
+	vm_offset_t page;
+
+	if (entry != NULL && (*entry & 1)) {
+		for (uint32_t i = 0; i < space.count; i++) {
+			if (space.phys[i] == (*entry & PTE_ADDRESS)) {
+				return space.table[i];
+			}
+		}
+		return NULL;
+	}
+	if (space.count == SPACE_TABLES || kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return NULL;
+	}
+	table = (uint64_t *)page;       /* a 4K table at the start of a page of ours (16K pages hold four; one is enough) */
+	space.table[space.count] = table;
+	space.phys[space.count++] = kvtophys(page);
+	if (entry != NULL) {
+		*entry = kvtophys(page) | PTE_TABLE;
+	}
+	return table;
+}
+
+/* One 4K page of the core's addresses to one of ours. */
+static bool
+space_map(uint64_t address, uint64_t phys)
+{
+	uint64_t *level2, *level3;
+
+	if (space.count == 0 && space_table(NULL) == NULL) {
+		return false;
+	}
+	if ((level2 = space_table(&space.table[0][address >> 30 & 0x1ff])) == NULL ||
+	    (level3 = space_table(&level2[address >> 21 & 0x1ff])) == NULL) {
+		return false;
+	}
+	level3[address >> 12 & 0x1ff] = phys | PTE_CORE | PTE_PAGE;
+	return true;
+}
+
+/* Memory of ours, `size` bytes of pages, at an address of the core's. */
+static bool
+space_block(uint64_t address, vm_offset_t memory, uint32_t size)
+{
+	for (uint32_t offset = 0; offset < size; offset += 4096) {
+		if (!space_map(address + offset, kvtophys(memory + offset))) {
+			printf("a610: no room for the tables at %#llx\n", address + offset);
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Context 0 with our tables, and the GPU's stream through it; what the SMMU made of each write is checked. */
+static bool
+space_on(void)
+{
+	vm_offset_t cb = smmu + 0x8000;         /* 8 pages of 4K before the contexts' own (step 7) */
+	uint64_t root = space.phys[0];          /* context tag 0 */
+
+	for (uint32_t i = 0; i < space.count; i++) {
+		to_memory((vm_offset_t)space.table[i], 4096);
+	}
+	wr(cb + 0x00, 0);
+	wr(smmu + 0x1800, 1);                   /* CBA2R 0: 64-bit */
+	wr(smmu + 0x1000, SMMU_CBAR_STAGE_1);   /* CBAR 0 */
+	wr(cb + SMMU_CB_TCR2, SMMU_TCR2);
+	wr(cb + SMMU_CB_TCR, SMMU_TCR_39_BITS);
+	put64(cb + SMMU_CB_TTBR0, root);
+	put64(cb + SMMU_CB_TTBR1, 0);
+	wr(cb + SMMU_CB_MAIR0, SMMU_MAIR0);
+	wr(cb + SMMU_CB_MAIR1, 0);
+	wr(cb + SMMU_CB_FSR, SMMU_FSR_ALL);
+	wr(cb + SMMU_CB_TLBIASID, 0);
+	wr(cb + SMMU_CB_TLBSYNC, 1);
+	for (int i = 0; i < 1000 && (rd(cb + SMMU_CB_TLBSTATUS) & 1); i++) {
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	wr(cb + 0x00, SMMU_SCTLR_ON);
+	wr(smmu + 0xc00, 0);                    /* S2CR 0: translate, context 0 */
+	wr(smmu + 0x800, SMMU_GPU_SMR);
+	__builtin_arm_dsb(0xf);
+	printf("a610: SMMU context 0: CBAR %#x, CBA2R %#x, SCTLR %#x, TCR %#x, TCR2 %#x, TTBR0 %#x:%#x (ours %#llx), TLB %#x; "
+	    "stream 0: SMR %#x, S2CR %#x\n", rd(smmu + 0x1000), rd(smmu + 0x1800), rd(cb), rd(cb + SMMU_CB_TCR),
+	    rd(cb + SMMU_CB_TCR2), rd(cb + SMMU_CB_TTBR0 + 4), rd(cb + SMMU_CB_TTBR0), root, rd(cb + SMMU_CB_TLBSTATUS),
+	    rd(smmu + 0x800), rd(smmu + 0xc00));
+	if (rd(smmu + 0x800) != SMMU_GPU_SMR || (rd(smmu + 0xc00) & 0x300ff) != 0 || !(rd(cb) & 1) ||
+	    (rd(smmu + 0x1000) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) || rd(cb + SMMU_CB_TTBR0) != (uint32_t)root ||
+	    rd(cb + SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
+		printf("a610: the SMMU did NOT take it: the GPU's stream is not going through our tables\n");
+		return false;
+	}
+	printf("a610: the GPU's stream goes through our tables (%u of them)\n", space.count);
+	return true;
+}
+
+/* What context 0 has recorded of a request it could not serve. */
+static bool
+space_faulted(const char *when)
+{
+	vm_offset_t cb = smmu + 0x8000;
+
+	if ((rd(cb + SMMU_CB_FSR) & SMMU_FSR_ALL) == 0) {
+		return false;
+	}
+	printf("a610: THE SMMU REFUSED the core %s: status %#x, address %#x:%#x, syndrome %#x\n", when, rd(cb + SMMU_CB_FSR),
+	    rd(cb + SMMU_CB_FAR + 4), rd(cb + SMMU_CB_FAR), rd(cb + SMMU_CB_FSYNR0));
+	return true;
 }
 
 static uint32_t
@@ -278,6 +439,70 @@ static void
 ring_command(uint32_t command, uint32_t words)
 {
 	ring(7u << 28 | words | odd_parity(words) << 15 | command << 16 | odd_parity(command) << 23);
+}
+
+/* A register of the 3D core (by its word number) written by command, in the order of the other commands. */
+static void
+ring_register(uint32_t number, uint32_t value)
+{
+	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
+	ring(value);
+}
+
+/*
+ * Step 13: the 2D engine filling a rectangle with one colour, as redwood_adreno.c's step 22 (Mesa's
+ * fd6_blitter: fd6_clear_surface; registers under their a6xx.xml names). Rows of a multiple of 64
+ * bytes. What differs on the A610 is the colour cache's offset when it draws straight into memory:
+ * Mesa's ccu_offset_bypass = num_ccu (1 here, freedreno_devices.py) x 64 KB, in RB_CCU_CNTL's
+ * COLOR_OFFSET [31:23] in 4K -- the A630's two make the 0x10000000 Mesa once had as a constant.
+ */
+#define CP_WAIT_FOR_IDLE        0x26
+#define CP_BLIT                 0x2c
+#define CP_EVENT_WRITE          0x46
+#define CP_SET_MARKER           0x65
+#define RB_CCU_CNTL             0x8e07
+#define A610_CCU_CNTL_BYPASS    (0x10000u >> 12 << 23)
+#define GRAS_2D_BLIT_CNTL       0x8400
+#define GRAS_2D_DST_TL          0x8405
+#define GRAS_2D_DST_BR          0x8406
+#define RB_2D_BLIT_CNTL         0x8c00
+#define RB_2D_PIXEL_CNTL        0x8c01
+#define RB_2D_DST_INFO          0x8c17
+#define RB_2D_DST               0x8c18
+#define RB_2D_DST_PITCH         0x8c1a
+#define RB_2D_SRC_SOLID_C0      0x8c2c
+#define SP_2D_DST_FORMAT        0xacc0
+#define FORMAT_8888             0x30
+#define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24)
+#define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)
+#define EVENT_FLUSH_COLOR       0x1d
+#define EVENT_CACHE_FLUSH       0x04
+#define PICTURE_WIDTH           1080
+#define PICTURE_HEIGHT          2340
+#define PICTURE_ROW             4352            /* 1088 pixels: the next multiple of 64 bytes */
+
+extern void MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes);
+
+static void
+ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue)
+{
+	ring_register(GRAS_2D_DST_TL, top << 16);
+	ring_register(GRAS_2D_DST_BR, (PICTURE_WIDTH - 1) | (bottom - 1) << 16);
+	ring_register(RB_2D_SRC_SOLID_C0, red);
+	ring_register(RB_2D_SRC_SOLID_C0 + 1, green);
+	ring_register(RB_2D_SRC_SOLID_C0 + 2, blue);
+	ring_register(RB_2D_SRC_SOLID_C0 + 3, 255);
+	ring_register(RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
+	ring_register(GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
+	ring_register(SP_2D_DST_FORMAT, 1 | FORMAT_8888 << 3 | 0xfu << 12);
+	ring_register(RB_2D_PIXEL_CNTL, 0);
+	ring_register(RB_2D_DST_INFO, DST_BGRA_LINEAR);
+	ring_register(RB_2D_DST, (uint32_t)TARGET_ADDRESS);
+	ring_register(RB_2D_DST + 1, (uint32_t)(TARGET_ADDRESS >> 32));
+	ring_register(RB_2D_DST_PITCH, PICTURE_ROW >> 6);
+	ring_command(CP_WAIT_FOR_IDLE, 0);
+	ring_command(CP_BLIT, 1);
+	ring(3);                                /* "scale": the 2D engine's one operation */
 }
 
 /* Let the core have what is in the ring, and wait until it has taken all of it and rests. */
@@ -353,8 +578,24 @@ scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
 	 * A call that takes TrustZone a while (checking a signature) comes back "interrupted" whenever
 	 * an interrupt is due, and is resumed so: as often as it takes, up to 20 s of it.
 	 */
+	/*
+	 * Should it go on saying "interrupted": an interrupt pending for this side that is never taken
+	 * would do that. The first few times and the last say how soon it came back and what this
+	 * processor has pending (ICC_HPPIR1_EL1: the highest group 1 interrupt; ISR_EL1; DAIF).
+	 */
+	uint64_t started = mach_absolute_time(), before = started, i = 0;
+
 	clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
-	for (uint64_t i = 0; i == 0 || mach_absolute_time() < deadline; i++) {
+	for (i = 0; i == 0 || mach_absolute_time() < deadline; i++) {
+		if (i > 0 && (i <= 4 || (i & (i - 1)) == 0)) {
+			uint64_t now = mach_absolute_time(), ns;
+
+			absolutetime_to_nanoseconds(now - before, &ns);
+			printf("a610: ... interrupted (%llu): %llu us since the last; pending %#llx, ISR %#llx, DAIF %#llx, on cpu %d\n", i,
+			    ns / 1000, __builtin_arm_rsr64("S3_0_C12_C12_2"), __builtin_arm_rsr64("S3_0_C12_C1_0"),
+			    __builtin_arm_rsr64("DAIF"), cpu_number());
+		}
+		before = mach_absolute_time();
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
 		register uint64_t x2 __asm__("x2") = first;
@@ -373,7 +614,9 @@ scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
 			return (int32_t)x0;
 		}
 	}
-	printf("a610: TrustZone still says the call was interrupted after 20 s\n");
+	printf("a610: TrustZone still says the call was interrupted after 20 s (%llu times; pending %#llx, ISR %#llx)\n", i,
+	    __builtin_arm_rsr64("S3_0_C12_C12_2"), __builtin_arm_rsr64("S3_0_C12_C1_0"));
+	(void)started;
 	return -1;
 }
 
@@ -723,10 +966,19 @@ step10:
 		 * halted nothing of the core reaches memory, and a command processor waiting for its microcode
 		 * or its ring says nothing about it.
 		 */
-		uint32_t bypass = 0;
+		uint32_t bypass = 0, translate = 0;
 
 		PE_parse_boot_argn("a610_bypass", &bypass, sizeof(bypass));
-		if (bypass && smmu != 0) {
+		PE_parse_boot_argn("a610_smmu", &translate, sizeof(translate));
+		core_address = core_phys;
+		if (translate && smmu != 0) {
+			/* our tables: the ring, the microcode and the page at CORE_ADDRESS, nothing else yet */
+			if (!space_block(CORE_ADDRESS, core_memory, CORE_MEMORY_SIZE) || !space_on()) {
+				redwood_status(REDWOOD_STATUS_GPU, "FAILED 11: the SMMU does not take our tables");
+				goto out;
+			}
+			core_address = CORE_ADDRESS;
+		} else if (bypass && smmu != 0) {
 			/*
 			 * SMMU v2: S2CR TYPE [17:16] (0 translate, 1 bypass), CBNDX [7:0]; SMR VALID [31], MASK [30:16],
 			 * ID [14:0]. A bypass S2CR (the first try) came back as "fault" and the SMR not taken: Qualcomm's
@@ -800,8 +1052,8 @@ step10:
 		wr(gpu + RBBM_PERFCTR_CNTL, 1);
 		wr(gpu + RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x3ffff);    /* the A610's */
 		wr(gpu + UCHE_CLIENT_PF, 1u << 7 | 1);
-		put64(gpu + CP_SQE_INSTR_BASE, core_phys + CORE_SQE_OFFSET);
-		put64(gpu + CP_RB_BASE, core_phys);
+		put64(gpu + CP_SQE_INSTR_BASE, core_address + CORE_SQE_OFFSET);
+		put64(gpu + CP_RB_BASE, core_address);
 		wr(gpu + CP_RB_CNTL, CP_RB_CNTL_VALUE);
 		printf("a610: microcode at %#x:%#x, ring at %#x:%#x, ring control %#x, status %#x\n", rd(gpu + CP_SQE_INSTR_BASE + 4),
 		    rd(gpu + CP_SQE_INSTR_BASE), rd(gpu + CP_RB_BASE + 4), rd(gpu + CP_RB_BASE), rd(gpu + CP_RB_CNTL),
@@ -837,7 +1089,7 @@ step10:
 	redwood_status(REDWOOD_STATUS_GPU, "step 12: first write");
 	{
 		volatile uint32_t *page = (volatile uint32_t *)(core_memory + CORE_SCRATCH_OFFSET);
-		uint64_t target = core_phys + CORE_SCRATCH_OFFSET;
+		uint64_t target = core_address + CORE_SCRATCH_OFFSET;
 		static const uint32_t words[] = { 0x600dc0de, 0x600dc0d1 };
 		bool wrote = false;
 
@@ -873,9 +1125,114 @@ step10:
 		}
 		redwood_status(REDWOOD_STATUS_GPU, wrote ? "GPU RUNS COMMANDS and writes memory" : "FAILED 12: page reads %#x",
 		    page[0]);
+		if (!wrote) {
+			goto out;
+		}
+	}
+	if (steps < 13) {
+		goto out;
+	}
+
+	printf("a610: step 13: a picture filled by the 2D engine, on the panel\n");
+	redwood_status(REDWOOD_STATUS_GPU, "step 13: a picture");
+	if (core_address != CORE_ADDRESS) {
+		printf("a610: left out: 10 MB of pages need the SMMU's tables (a610_smmu=1)\n");
+		goto out;
+	}
+	{
+		vm_offset_t picture;
+		const volatile uint8_t *pixel;
+		volatile uint32_t *page = (volatile uint32_t *)(core_memory + CORE_SCRATCH_OFFSET);
+
+		if (kmem_alloc(kernel_map, &picture, round_page(PICTURE_ROW * PICTURE_HEIGHT), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || !space_block(TARGET_ADDRESS, picture, PICTURE_ROW * PICTURE_HEIGHT)) {
+			printf("a610: no memory for the picture\n");
+			goto out;
+		}
+		to_memory(picture, PICTURE_ROW * PICTURE_HEIGHT);
+		/* the new tables (and new entries of old ones) out to memory; the SMMU has not seen these addresses */
+		for (uint32_t i = 0; i < space.count; i++) {
+			to_memory((vm_offset_t)space.table[i], 4096);
+		}
+		printf("a610: the picture: %u x %u, rows of %u bytes, at %#llx for the core (%u tables)\n", PICTURE_WIDTH,
+		    PICTURE_HEIGHT, PICTURE_ROW, TARGET_ADDRESS, space.count);
+		/*
+		 * The first run had every command taken and both flush words written, no SMMU fault, and the
+		 * picture all zeros. Two things are tried, in turn: Mesa's raw "magic" registers for the A610
+		 * (a6xx_gen1_low_raw_magic_regs) with the core as it is, in secure mode; then, should the
+		 * picture still be empty, the core out of secure mode by packet (CP_SET_SECURE_MODE 0) and the
+		 * same once more -- in secure mode the colour units may write as the secure stream (SID 2),
+		 * which goes nowhere of ours.
+		 */
+		static const uint32_t magic[][2] = {
+			{ 0x9804, 0xf }, { 0x9805, 0 }, { 0xa0f8, 0 }, { 0xb600, 0 }, { 0x8600, 0 }, { 0xae03, 0 }, { 0xae00, 0 },
+			{ 0xbe04, 0 }, { 0x9600, 0 }, { 0x0e12, 0x10000000 }, { 0x8e01, 0x1 }, { 0x8e04, 0x04100000 },
+		};
+		bool drawn = false;
+
+		for (unsigned attempt = 0; attempt < 2 && !drawn; attempt++) {
+			if (attempt == 1) {
+				ring_command(CP_SET_SECURE_MODE, 1);
+				ring(0);
+				if (!ring_run("leave secure mode (CP_SET_SECURE_MODE 0)")) {
+					space_faulted("leaving secure mode");
+					redwood_status(REDWOOD_STATUS_GPU, "FAILED 13: CP_SET_SECURE_MODE 0 does not go through");
+					goto out;
+				}
+				printf("a610: RBBM_SECVID_TRUST_CNTL is %#x after it\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
+			}
+			for (unsigned i = 0; i < sizeof(magic) / sizeof(magic[0]); i++) {
+				ring_register(magic[i][0], magic[i][1]);
+			}
+			ring_command(CP_SET_MARKER, 1);
+			ring(12);                               /* "2D blits follow" */
+			ring_register(RB_CCU_CNTL, A610_CCU_CNTL_BYPASS | 1);   /* bit 0: no GMEM fast clear on the A610 */
+			ring_fill(0, 780, 255, 128, 0);         /* orange */
+			ring_fill(780, 1560, 255, 255, 255);
+			ring_fill(1560, PICTURE_HEIGHT, 0, 128, 255);
+			/* what it has drawn out of its caches into memory: each event writes a word of ours when done */
+			ring_command(CP_EVENT_WRITE, 4);
+			ring(EVENT_FLUSH_COLOR);
+			ring((uint32_t)(core_address + CORE_SCRATCH_OFFSET + 32));
+			ring(0);
+			ring(0x0c0c0c0c + attempt);
+			ring_command(CP_EVENT_WRITE, 4);
+			ring(EVENT_CACHE_FLUSH);
+			ring((uint32_t)(core_address + CORE_SCRATCH_OFFSET + 16));
+			ring(0);
+			ring(0x0d0e0d0e + attempt);
+			ring_command(CP_WAIT_FOR_IDLE, 0);
+			if (!ring_run(attempt == 0 ? "fill a picture, in secure mode" : "fill a picture, out of secure mode")) {
+				space_faulted("filling the picture");
+				redwood_status(REDWOOD_STATUS_GPU, "FAILED 13: the fill does not go through");
+				goto out;
+			}
+			space_faulted("filling the picture");
+			to_memory(core_memory + CORE_SCRATCH_OFFSET, 64);
+			printf("a610: the words it writes when its caches are in memory: %#x, %#x (told: %#x, %#x)\n", page[8], page[4],
+			    0x0c0c0c0c + attempt, 0x0d0e0d0e + attempt);
+			to_memory(picture, PICTURE_ROW * PICTURE_HEIGHT);
+			pixel = (const volatile uint8_t *)picture;
+			printf("a610: the picture's first pixel is %02x %02x %02x %02x (blue green red alpha; told: 00 80 ff ff), one in "
+			    "the middle %02x %02x %02x %02x, one in the last row %02x %02x %02x %02x\n", pixel[0], pixel[1], pixel[2],
+			    pixel[3], pixel[1170 * PICTURE_ROW + 2160], pixel[1170 * PICTURE_ROW + 2161], pixel[1170 * PICTURE_ROW + 2162],
+			    pixel[1170 * PICTURE_ROW + 2163], pixel[2339 * PICTURE_ROW + 4316], pixel[2339 * PICTURE_ROW + 4317],
+			    pixel[2339 * PICTURE_ROW + 4318], pixel[2339 * PICTURE_ROW + 4319]);
+			drawn = (pixel[0] | pixel[1] | pixel[2]) != 0 && pixel[1170 * PICTURE_ROW + 2160] != 0 &&
+			    (pixel[2339 * PICTURE_ROW + 4316] | pixel[2339 * PICTURE_ROW + 4317] | pixel[2339 * PICTURE_ROW + 4318]) != 0;
+			printf("a610: attempt %u (%s): %s\n", attempt + 1, attempt == 0 ? "secure mode" : "after CP_SET_SECURE_MODE 0",
+			    drawn ? "DRAWN" : "the picture is not what the 3D core was told to draw");
+		}
+		if (!drawn) {
+			redwood_status(REDWOOD_STATUS_GPU, "FAILED 13: the picture is not drawn");
+			goto out;
+		}
+		MiniIOMobileFramebufferShow((const uint8_t *)picture, PICTURE_WIDTH, PICTURE_HEIGHT, PICTURE_ROW);
+		printf("a610: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top\n");
+		redwood_status(REDWOOD_STATUS_GPU, "GPU DRAWS: its picture is on the panel");
 	}
 out:
-	printf("a610: stopping after step %u (a610=%u)\n", steps < 12 ? steps : 12, steps);
+	printf("a610: stopping after step %u (a610=%u)\n", steps < 13 ? steps : 13, steps);
 	thread_terminate(current_thread());
 }
 
