@@ -8,13 +8,15 @@
  * wallpaper. The kernel's APFS driver reads and does not write, and writing APFS is not the point
  * here -- what is needed is that the bytes come back. So the tree is packed into a plain archive
  * and the archive is written into the one place on the phone's flash this port owns and nothing of
- * it uses: the partition darwin, past the iOS volume and both cryptexes. The kernel takes those
- * writes on /dev/rufs_darwin alone and refuses anything else (bsd/dev/redwood_ufs.c, ufs_write=1).
+ * it uses: the store, past the iOS volume and both cryptexes -- the partition darwin on redwood,
+ * system on willow (STORES below). The kernel takes those writes on that partition's character
+ * device alone and refuses anything else (bsd/dev/redwood_ufs.c, ufs_write=1, kern.redwood.ufs_store).
  *
  *   var_store save          pack /private/var into the store
  *   var_store load          unpack the newest good store into /private/var (init, at boot)
  *   var_store watch [SECS]  stay and save by itself: when the kernel says the run is ending, and
- *                           every SECS seconds besides (a launchd job of ours does this)
+ *                           every SECS seconds besides (a launchd job of ours does this; without
+ *                           SECS, var_save_every=SECS among the kernel's arguments says it)
  *   var_store show          what the store holds, both slots
  *   var_store erase         forget both slots (the next boot starts empty again)
  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
@@ -54,10 +56,8 @@
 
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
-#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
+#define STORE_AT        8589934592LL            /* block 2097152 of 4096: past the cryptexes, with room to spare */
 #define SLOTS           2
-#define DEVICE          "/dev/rufs_darwin"
 #define STATE_AT        8566865920LL            /* darwin's block 2091520: the boot state (common/flash/bundlefmt.py) */
 #define BOOTOK_AFTER    60                      /* seconds of a run that make it a good start */
 #define ROOT            "/private/var"
@@ -73,6 +73,22 @@
  * the flags only a single-user boot can clear.
  */
 #define FLAGS_KEPT      (0x1u | 0x2u | 0x4u | 0x8u | 0x8000u)   /* nodump, immutable, append, opaque, hidden */
+
+/*
+ * The partitions a store may be in, and how much a slot of each holds: the cryptexes end at the
+ * same byte on both (the same image of 2042368 blocks of 4096), so a slot is what is left past
+ * STORE_AT, halved -- 2 GiB of darwin's 20, 1 GiB of system's 10.
+ */
+static const struct {
+	const char *name;
+	long long slot_bytes;
+} STORES[] = {
+	{ "darwin", 0x80000000LL },
+	{ "system", 0x40000000LL },
+};
+
+static char store_device[48];           /* /dev/rufs_NAME of the store: pick_store() */
+static long long slot_bytes;            /* what a slot of it holds */
 
 /* the directories whose contents are not kept (the directory itself is) */
 static const char *const SKIP[] = {
@@ -116,6 +132,34 @@ struct entry {
 
 /* ---- the kernel's side of it: the boot-arg, the handshake, the claim ---- */
 
+/*
+ * Which partition is the store: the one the kernel takes writes for this run, or -- when it takes
+ * none (ufs_write=1 is not given; a load only reads) -- the first of STORES the phone has.
+ */
+static int
+pick_store(void)
+{
+	char name[32] = "";
+	size_t len = sizeof(name) - 1;
+	struct stat st;
+
+	if (sysctlbyname("kern.redwood.ufs_store", name, &len, NULL, 0) != 0) {
+		name[0] = 0;
+	}
+	name[sizeof(name) - 1] = 0;
+	for (unsigned i = 0; i < sizeof(STORES) / sizeof(STORES[0]); i++) {
+		strcpy(store_device, "/dev/rufs_");
+		strcpy(store_device + 10, STORES[i].name);
+		if (name[0] ? strcmp(name, STORES[i].name) == 0 : stat(store_device, &st) == 0) {
+			slot_bytes = STORES[i].slot_bytes;
+			return 1;
+		}
+	}
+	printf("var_store: no store: %s\n", name[0] ? "the kernel names one this program does not know" :
+	    "the kernel takes no writes, and no partition of one is there");
+	return 0;
+}
+
 #define VAR_SAVE_NONE   0
 #define VAR_SAVE_IDLE   1
 #define VAR_SAVE_WANTED 2
@@ -156,6 +200,31 @@ parse_number(const char *text)
 		value = value * 10 + (*text - '0');
 	}
 	return value;
+}
+
+/* The number NAME=NUMBER among the kernel's arguments says; 0 if it is not there. */
+static long
+boot_arg_number(const char *name)
+{
+	static char args[1024];
+	size_t len = sizeof(args) - 1, n = strlen(name);
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return 0;
+	}
+	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
+	for (char *p = args; *p;) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (strncmp(p, name, n) == 0 && p[n] == '=') {
+			return parse_number(p + n + 1);
+		}
+		while (*p && *p != ' ') {
+			p++;
+		}
+	}
+	return 0;
 }
 
 static int
@@ -244,7 +313,7 @@ static uint64_t entries;
 static off_t
 slot_at(int slot)
 {
-	return STORE_AT + (off_t)slot * SLOT_BYTES;
+	return STORE_AT + (off_t)slot * slot_bytes;
 }
 
 static int
@@ -435,7 +504,7 @@ static void
 stream_start(int slot, uint64_t bytes)
 {
 	at = slot_at(slot) + BLOCK;
-	stream_limit = slot_at(slot) + SLOT_BYTES;
+	stream_limit = slot_at(slot) + slot_bytes;
 	buffered = taken = 0;
 	stream_bytes = 0;
 	stream_left = bytes;
@@ -455,7 +524,7 @@ read_head(int slot, struct head *into)
 		return 0;
 	}
 	if (memcmp(h->magic, HEAD_MAGIC, sizeof(h->magic)) != 0 || h->version != HEAD_VERSION ||
-	    h->slot != (uint32_t)slot || h->bytes > (uint64_t)SLOT_BYTES - BLOCK ||
+	    h->slot != (uint32_t)slot || h->bytes > (uint64_t)slot_bytes - BLOCK ||
 	    h->head_crc != head_checksum(h)) {
 		return 0;
 	}
@@ -869,9 +938,9 @@ save(void)
 	}
 	h.crc = stream_crc ^ 0xffffffffu;
 	h.head_crc = head_checksum(&h);
-	if (h.bytes > (uint64_t)SLOT_BYTES - BLOCK) {
+	if (h.bytes > (uint64_t)slot_bytes - BLOCK) {
 		printf("var_store: the archive is %llu bytes, more than a slot holds (%llu): nothing saved\n",
-		    (unsigned long long)h.bytes, (unsigned long long)(SLOT_BYTES - BLOCK));
+		    (unsigned long long)h.bytes, (unsigned long long)(slot_bytes - BLOCK));
 		return 0;
 	}
 	memset(block, 0, sizeof(block));
@@ -1257,9 +1326,9 @@ save_once(void)
 	 * device is closed (bsd/dev/redwood_ufs.c, ufs_cclose). A watcher that kept the device open
 	 * would leave iOS reading the flash through the loader for the rest of the run.
 	 */
-	fd = open(DEVICE, O_RDWR, 0);
+	fd = open(store_device, O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
+		printf("var_store: %s: %s\n", store_device, strerror(errno));
 		return 0;
 	}
 	ok = claim() && save();
@@ -1297,9 +1366,9 @@ bootok(void)
 	struct boot_state st;
 	int ok;
 
-	fd = open(DEVICE, O_RDWR, 0);
+	fd = open(store_device, O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: bootok: %s: %s\n", DEVICE, strerror(errno));
+		printf("var_store: bootok: %s: %s\n", store_device, strerror(errno));
 		return 0;
 	}
 	ok = device_read(STATE_AT, block, BLOCK);
@@ -1340,9 +1409,9 @@ watch(int seconds)
 	uint64_t last = 0;
 	int asked = 0;
 
-	fd = open(DEVICE, O_RDWR, 0);
+	fd = open(store_device, O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: %s cannot be written (%s): nothing would be saved\n", DEVICE,
+		printf("var_store: %s cannot be written (%s): nothing would be saved\n", store_device,
 		    strerror(errno));
 		return 0;
 	}
@@ -1441,6 +1510,9 @@ main(int argc, char **argv, char **envp)
 
 	(void)envp;
 	crc_init();
+	if (!pick_store()) {
+		return 1;
+	}
 	if (strcmp(what, "bootok") == 0) {
 		return bootok() ? 0 : 1;
 	}
@@ -1463,11 +1535,11 @@ main(int argc, char **argv, char **envp)
 			printf("var_store: not asked to keep the data volume (var_store=1): nothing to watch\n");
 			return 0;
 		}
-		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+		return watch((int)(argc > 2 ? parse_number(argv[2]) : boot_arg_number("var_save_every"))) ? 0 : 1;
 	}
-	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
+	fd = open(store_device, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
+		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", store_device,
 		    strerror(errno));
 		return 1;
 	}

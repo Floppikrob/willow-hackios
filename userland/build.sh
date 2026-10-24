@@ -551,6 +551,13 @@ if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
+# ... and the touch screen's firmware of willow (Redmi Note 8T), which its Novatek chip has no flash
+# for: the phone's /vendor/firmware/novatek_ts_tianma_fw.bin into ../fw-touch as novatek_ts_fw.bin
+# (bsd/dev/redwood_novatek.c; 116 KB)
+if [ -f ../fw-touch/novatek_ts_fw.bin ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-touch/novatek_ts_fw.bin root/fw/
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (bsd/dev/redwood_wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
