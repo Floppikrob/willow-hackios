@@ -1,0 +1,10 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist), on the willow.
+# A triangle by the OpenGL ES library of the image (build.sh GL=test), drawn by the Adreno 610 when
+# the kernel has kept it on (a610_keep=1, bsd/dev/redwood_a610.c): its steps take some 40 s of the
+# boot before the service RedwoodGPU is there, so it waits first; then the panel's own size, and
+# how long the GPU takes over a frame of it.
+# The wait is cpu_test's and not rwtouch's: rwtouch opens /dev/redwood-touch first, and on the
+# willow it did not come back from there (the list got no further in 160 s).
+/redwood/bin/cpu_test 40
+/redwood/bin/gl_test 20 1080 2340
+/redwood/bin/gl_test fill 1080 2340
