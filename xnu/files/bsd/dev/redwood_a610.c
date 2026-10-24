@@ -383,6 +383,12 @@ core_speed_measured(void)
 #define UCHE_GMEM_RANGE_MAX     GPU_WORD(0x0e0d)
 #define UCHE_CACHE_WAYS         GPU_WORD(0x0e17)
 #define UCHE_FILTER_CNTL        GPU_WORD(0x0e18)
+#define UCHE_MODE_CNTL          GPU_WORD(0x0e01)
+#define RBBM_NC_MODE_CNTL       GPU_WORD(0x0534)
+#define RB_NC_MODE_CNTL         GPU_WORD(0x8e08)
+#define SP_NC_MODE_CNTL         GPU_WORD(0xae02)
+#define TPL1_NC_MODE_CNTL       GPU_WORD(0xb604)
+#define GMEM_SIZE               (128u * 1024 + 4096)    /* adreno_device.c: SZ_128K + SZ_4K */
 #define PC_DBG_ECO_CNTL         GPU_WORD(0x9e00)
 #define RBBM_SECVID_TRUST_CNTL  GPU_WORD(0xf400)
 #define RBBM_SECVID_TSB_TRUSTED_BASE GPU_WORD(0xf800)
@@ -1019,7 +1025,7 @@ zap_load(const uint8_t *header, uint32_t segments)
  * the commands in a command buffer of their own, and a submission waited for by its number.
  */
 #define GPU_CHIP_ID_A610        0x06010000ull   /* Linux's adreno_device.c, Mesa's freedreno_devices.py */
-#define GPU_GMEM_A610           (128u * 1024 + 4096)    /* adreno_device.c: SZ_128K + SZ_4K */
+#define GPU_GMEM_A610           GMEM_SIZE
 #define KEPT_FENCE_AT           0x40            /* in the scratch page */
 #define KEPT_TIMES_AT           0x400           /* ... and when the core began and ended its last submissions */
 #define KEPT_TIMES              64
@@ -1818,9 +1824,19 @@ step10:
 		put64(gpu + UCHE_TRAP_BASE, 0x0001fffffffff000ull);
 		put64(gpu + UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
 		put64(gpu + UCHE_GMEM_RANGE_MIN, 0x00100000);
-		put64(gpu + UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x20000 - 1);     /* the A610's 128 KB of GMEM */
+		put64(gpu + UCHE_GMEM_RANGE_MAX, 0x00100000 + GMEM_SIZE - 1);   /* the A610's GMEM */
 		wr(gpu + UCHE_FILTER_CNTL, 0x804);
 		wr(gpu + UCHE_CACHE_WAYS, 0x4);
+		/*
+		 * How compressed (UBWC) pictures are laid out: a6xx_set_ubwc_config with the A610's numbers
+		 * (a6xx_calc_ubwc_config: highest bank bit 13, min_acc_len 1, swizzle 7, no macrotiling) --
+		 * the same ones the GPU parameters tell Mesa, which lays its pictures out by them.
+		 */
+		wr(gpu + RB_NC_MODE_CNTL, 1u << 3 | 1);
+		wr(gpu + TPL1_NC_MODE_CNTL, 1u << 3 | 1);
+		wr(gpu + SP_NC_MODE_CNTL, 1u << 3 | 1);
+		wr(gpu + UCHE_MODE_CNTL, 1u << 23);
+		wr(gpu + RBBM_NC_MODE_CNTL, 0);
 		wr(gpu + CP_ROQ_THRESHOLDS_2, 0x00800060);                     /* the A610's */
 		wr(gpu + CP_ROQ_THRESHOLDS_1, 0x40201b16);
 		wr(gpu + CP_MEM_POOL_SIZE, 48);
