@@ -89,6 +89,9 @@ static vm_offset_t msg_ram, ipc;
 #define TYPE_BUS_CLK            0x316b6c63      /* "clk1" */
 #define TYPE_MEM_CLK            0x326b6c63      /* "clk2" */
 #define TYPE_CE_CLK             0x00006563      /* "ce" */
+#define TYPE_RAIL_CX            0x78637772      /* "rwcx" */
+#define TYPE_RAIL_MX            0x786d7772      /* "rwmx" */
+#define KEY_LEVEL               0x6c766c76      /* "vlvl" */
 
 /* redwood_a610.c waits for this: the RPM's requests are done, whatever they came to (or rpm= was not given) */
 volatile int redwood_rpm_done;
@@ -231,15 +234,27 @@ fifo_take(void)
 		printf("rpm: ... GLINK data of channel %u, %u bytes: service %#x, first message %#x (%s), id or text %08x %08x\n",
 		    words[0] >> 16, words[2], words[4], words[6], words[6] == 0x2367736d ? "msg#: done" : words[6] == 0x00727265 ?
 		    "err" : "?", words[8], words[9]);
+		if (words[6] == 0x2367736d && words[9] == 0x00727265) {
+			/* "msg#" and then "err": its text, as smd-rpm.c reads it ("resource does not exist", ...) */
+			char text[4 * 13 + 1];
+			uint32_t length = words[10] < sizeof(text) - 1 ? words[10] : sizeof(text) - 1;
+
+			memcpy(text, &words[11], length);
+			text[length] = 0;
+			printf("rpm: ... REFUSED: \"%s\"\n", text);
+			wr(msg_ram + rx.offset, head);
+			__builtin_arm_dsb(0xf);
+			return false;
+		}
 	}
 	wr(msg_ram + rx.offset, head);          /* taken */
 	__builtin_arm_dsb(0xf);
 	return true;
 }
 
-/* One key-value request (rate in kHz) for a resource of the RPM, active set; its answer said. */
+/* One key-value request for a resource of the RPM, active set; its answer said. */
 static bool
-rpm_ask(const char *what, uint32_t type, uint32_t id, uint32_t khz)
+rpm_ask_key(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value, const char *unit)
 {
 	static uint32_t msg_id = 0x7000;        /* (far from UEFI's own numbers) */
 	uint32_t m[14];
@@ -255,16 +270,40 @@ rpm_ask(const char *what, uint32_t type, uint32_t id, uint32_t khz)
 	m[8] = type;
 	m[9] = id;
 	m[10] = 12;
-	m[11] = KEY_KHZ;
+	m[11] = key;
 	m[12] = 4;
-	m[13] = khz;
-	printf("rpm: next: ask for %s at %u kHz (message %#x)\n", what, khz, m[6]);
+	m[13] = value;
+	printf("rpm: next: ask for %s at %u %s (message %#x)\n", what, value, unit, m[6]);
 	if (!fifo_put(m, sizeof(m))) {
 		return false;
 	}
 	wr(ipc + IPC_DOORBELL, 1);
 	__builtin_arm_dsb(0xf);
 	return fifo_take();
+}
+
+static bool
+rpm_ask(const char *what, uint32_t type, uint32_t id, uint32_t khz)
+{
+	return rpm_ask_key(what, type, id, KEY_KHZ, khz, "kHz");
+}
+
+/*
+ * A level for a rail, MX or CX, from redwood_a610.c once the requests of rpm_thread are done (only
+ * one asks at a time): the RPM's "rwmx" / "rwcx" 0 with the key "vlvl", as Linux's rpmpd does for
+ * SM6125 (RPM_SMD_LEVEL_*: 64 LOW_SVS, 128 SVS, 192 SVS_PLUS, 256 NOM, 320 NOM_PLUS, 384 TURBO).
+ * The RPM keeps the highest level anyone asks for, so this raises a rail and never lowers it
+ * below what another processor wants. False if the channel is not there (rpm= under 2) or the
+ * RPM refuses.
+ */
+bool
+redwood_rpm_level(const char *what, bool mx, uint32_t level)
+{
+	if (!tx.found || !rx.found || ipc == 0) {
+		printf("rpm: no channel to the RPM for %s (rpm=2 or more is needed)\n", what);
+		return false;
+	}
+	return rpm_ask_key(what, mx ? TYPE_RAIL_MX : TYPE_RAIL_CX, 0, KEY_LEVEL, level, "(level)");
 }
 
 static void

@@ -29,7 +29,8 @@
  *              clocks of that half: iface (gpu_cc_ahb), rbbmtimer (gpu_cc_cxo), the GMU wrapper's
  *              (gpu_cc_cx_gmu, with the vendor's wake and sleep counts) and the SMMU's vote
  *   5  writes  GX's power switch, and the 3D core's clock from the crystal (its source set to
- *              input 0 undivided, then the clock on)
+ *              input 0 undivided, then the clock on); with a610_mhz=N, from one of the GPU's PLLs
+ *              instead, the rails MX and CX asked of the RPM first (core_speed)
  *   6  reads   the first registers of the GPU block
  *   7  reads   the GPU's SMMU (0x59a0000): its ID registers and stream table, which the hypervisor
  *              answers for, and the first translation context, as the firmware and hypervisor left it
@@ -190,6 +191,154 @@ gdsc(const char *name, uint32_t offset)
 	printf("a610: power switch %s (%#x) = %#010x: %s%s\n", name, offset, value, (value & GDSC_ON) ? "ON" : "off",
 	    (value & GDSC_SW_COLLAPSE) ? ", asked to be off" : "");
 	return (value & GDSC_ON) != 0;
+}
+
+/*
+ * a610_mhz=N (with rpm=2 or more): the 3D core at one of the speeds of gpucc-trinket.c's table
+ * instead of the crystal's 19.2 MHz. The rails first, through the RPM: MX for the PLL, CX for the
+ * core, at the level the table gives -- but NOM at least on these first runs: nothing on this
+ * side has asked the RPM for CX before, and a lower level than the firmware's would be lower for
+ * every other clock the AP's half of the SoC runs on too. Then one of the GPU's two alpha PLLs at
+ * twice the speed (the source divides by 2), its aux2 output, as clk_alpha_pll_configure and
+ * clk_alpha_pll_enable do it; then the source switched to it, forced on while it changes
+ * (FORCE_ENABLE_RCG). PLL1 (its VCO 500 MHz-1 GHz) for 320 and 465, PLL0 (1-2 GHz) above.
+ * Returns the speed set, or 0 (the core stays on the crystal).
+ */
+extern bool redwood_rpm_level(const char *what, bool mx, uint32_t level);
+
+static const struct {
+	uint32_t mhz, level;
+} core_speeds[] = {
+	{ 320, 64 }, { 465, 128 }, { 600, 192 }, { 745, 256 }, { 820, 320 }, { 900, 384 }, { 950, 416 },
+};
+#define LEVEL_NOM               256
+
+#define PLL_MODE                0x00
+#define PLL_L                   0x04
+#define PLL_ALPHA               0x08
+#define PLL_ALPHA_U             0x0c
+#define PLL_USER                0x10
+#define PLL_CONFIG              0x18
+#define PLL_OUTCTRL             (1u << 0)
+#define PLL_BYPASSNL            (1u << 1)
+#define PLL_RESET_N             (1u << 2)
+#define PLL_LOCK_DET            (1u << 31)
+#define PLL_AUX2                (1u << 2)       /* the user control's aux2 output */
+#define PLL_ALPHA_EN            (1u << 24)
+#define PLL_CONFIG_VALUE        0x4001055b      /* gpu_pll0_config's and gpu_pll1_config's */
+#define RCG_UPDATE              (1u << 0)
+#define RCG_ROOT_EN             (1u << 1)
+#define RCG_ROOT_OFF            (1u << 31)
+
+static uint32_t core_mhz;               /* 0: the crystal's 19.2 */
+
+static uint32_t
+core_speed(uint32_t mhz)
+{
+	uint32_t level = 0, pll = 2 * mhz >= 1000 ? 0 : 1, source = pll == 0 ? 2 : 4;  /* gpu_cc_parent_map_1 */
+	uint32_t l = 20 * mhz / 192;            /* twice the speed over 19.2 MHz: L, and 40 bits of fraction */
+	uint64_t fraction = ((uint64_t)(20 * mhz % 192) << 40) / 192;
+	vm_offset_t p = gpucc + 0x100 * pll;
+	int i;
+
+	for (unsigned k = 0; k < sizeof(core_speeds) / sizeof(core_speeds[0]); k++) {
+		if (core_speeds[k].mhz == mhz) {
+			level = core_speeds[k].level;
+		}
+	}
+	if (level == 0) {
+		printf("a610: a610_mhz=%u is not one of 320 465 600 745 820 900 950: the core stays on the crystal\n", mhz);
+		return 0;
+	}
+	printf("a610: next: the core at %u MHz: rails MX and CX at level %u (the table's %u), PLL%u at %u MHz "
+	    "(L %#x, alpha %#llx), source input %u divided by 2\n", mhz, level < LEVEL_NOM ? LEVEL_NOM : level, level, pll,
+	    2 * mhz, l, fraction, source);
+	if (level < LEVEL_NOM) {
+		level = LEVEL_NOM;
+	}
+	if (!redwood_rpm_level("the rail MX", true, level) || !redwood_rpm_level("the rail CX", false, level)) {
+		printf("a610: the RPM has not given the rails: the core stays on the crystal\n");
+		return 0;
+	}
+	if (rd(p + PLL_MODE) & PLL_OUTCTRL) {
+		printf("a610: PLL%u is already running (mode %#x): not touched, the core stays on the crystal\n", pll,
+		    rd(p + PLL_MODE));
+		return 0;
+	}
+	wr(p + PLL_L, l);
+	wr(p + PLL_ALPHA, (uint32_t)fraction);
+	wr(p + PLL_ALPHA_U, (uint32_t)(fraction >> 32));
+	wr(p + PLL_CONFIG, PLL_CONFIG_VALUE);
+	wr(p + PLL_USER, (rd(p + PLL_USER) & ~(3u << 20)) | (pll == 0 ? 0u : 2u) << 20 | PLL_ALPHA_EN | PLL_AUX2);
+	printf("a610: PLL%u set: L %#x, alpha %#x %#x, user %#x, config %#x\n", pll, rd(p + PLL_L), rd(p + PLL_ALPHA),
+	    rd(p + PLL_ALPHA_U), rd(p + PLL_USER), rd(p + PLL_CONFIG));
+	/* out of bypass, 5 us, out of reset, its lock, then its outputs */
+	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_BYPASSNL);
+	delay_for_interval(5, NSEC_PER_USEC);
+	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_RESET_N);
+	for (i = 0; i < 200 && !(rd(p + PLL_MODE) & PLL_LOCK_DET); i++) {
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	if (!(rd(p + PLL_MODE) & PLL_LOCK_DET)) {
+		printf("a610: PLL%u DOES NOT LOCK in 2 ms (mode %#x): off again, the core stays on the crystal\n", pll,
+		    rd(p + PLL_MODE));
+		wr(p + PLL_MODE, 0);
+		return 0;
+	}
+	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_OUTCTRL);
+	printf("a610: PLL%u locked after %d us, its outputs on (mode %#x)\n", pll, 10 * i, rd(p + PLL_MODE));
+
+	wr(gpucc + 0x101c, rd(gpucc + 0x101c) | RCG_ROOT_EN);
+	for (i = 0; i < 100 && (rd(gpucc + 0x101c) & RCG_ROOT_OFF); i++) {
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	wr(gpucc + 0x1020, (rd(gpucc + 0x1020) & ~0x71fu) | source << 8 | (2 * 2 - 1));
+	wr(gpucc + 0x101c, rd(gpucc + 0x101c) | RCG_UPDATE);
+	for (i = 0; i < 500 && (rd(gpucc + 0x101c) & RCG_UPDATE); i++) {
+		delay_for_interval(10, NSEC_PER_USEC);
+	}
+	printf("a610: the 3D core's clock source: command %#x, configuration %#x (%s)\n", rd(gpucc + 0x101c),
+	    rd(gpucc + 0x1020), rd(gpucc + 0x101c) & RCG_UPDATE ? "the switch DID NOT TAKE" : "switched");
+	if (rd(gpucc + 0x101c) & RCG_UPDATE) {
+		return 0;
+	}
+	return mhz;
+}
+
+/*
+ * The core's speed as its own counter says: CP's first performance counter counting every cycle
+ * (PERF_CP_ALWAYS_COUNT, set in step 11 as Linux's hw_init does) over 20 ms of the timebase.
+ */
+#define RBBM_PERFCTR_CP_0       (4u * 0x0400)   /* low word, then high */
+#define CP_PERFCTR_CP_SEL_0     (4u * 0x08d0)
+#define PERF_CP_ALWAYS_COUNT    0
+
+static uint64_t
+cycles(void)
+{
+	uint32_t high, low;
+
+	do {
+		high = rd(gpu + RBBM_PERFCTR_CP_0 + 4);
+		low = rd(gpu + RBBM_PERFCTR_CP_0);
+	} while (rd(gpu + RBBM_PERFCTR_CP_0 + 4) != high);
+	return (uint64_t)high << 32 | low;
+}
+
+static void
+core_speed_measured(void)
+{
+	uint64_t c0, c1, t0, t1, ns;
+
+	c0 = cycles();
+	t0 = mach_absolute_time();
+	delay_for_interval(20, NSEC_PER_MSEC);
+	c1 = cycles();
+	t1 = mach_absolute_time();
+	absolutetime_to_nanoseconds(t1 - t0, &ns);
+	printf("a610: THE CORE'S SPEED, by its own counter: %llu cycles in %llu us = %llu MHz (asked for: %u)\n", c1 - c0,
+	    ns / 1000, ns ? (c1 - c0) * 1000 / ns : 0, core_mhz ? core_mhz : 19);
+	redwood_status(REDWOOD_STATUS_GPU, "commands RUN, core at %llu MHz", ns ? (c1 - c0) * 1000 / ns : 0);
 }
 
 /* ---- the 3D core: its registers (in words), its ring, its first commands (as bsd/dev/redwood_adreno.c) ---- */
@@ -745,11 +894,26 @@ a610_thread(void *parameter, __unused wait_result_t result)
 		delay_for_interval(10, NSEC_PER_USEC);
 	}
 	printf("a610: the 3D core's clock source: command %#x, configuration %#x\n", rd(gpucc + 0x101c), rd(gpucc + 0x1020));
+	{
+		uint32_t mhz = 0;
+
+		if (PE_parse_boot_argn("a610_mhz", &mhz, sizeof(mhz)) && mhz != 0) {
+			core_mhz = core_speed(mhz);
+		}
+	}
 	if (!clock_on("gpu_cc_gx_gfx3d_clk", gpucc, 0x1054, true)) {
 		redwood_status(REDWOOD_STATUS_GPU, "FAILED at step 5: the core clock does not run");
 		goto out;
 	}
-	redwood_status(REDWOOD_STATUS_GPU, "CX and GX on, core at 19.2 MHz");
+	if (core_mhz != 0) {
+		/* the branch keeps the source on from here: no longer forced (as clk_rcg2_clear_force_enable) */
+		wr(gpucc + 0x101c, rd(gpucc + 0x101c) & ~RCG_ROOT_EN);
+		printf("a610: the 3D core's clock source after: command %#x, configuration %#x\n", rd(gpucc + 0x101c),
+		    rd(gpucc + 0x1020));
+		redwood_status(REDWOOD_STATUS_GPU, "CX and GX on, core at %u MHz", core_mhz);
+	} else {
+		redwood_status(REDWOOD_STATUS_GPU, "CX and GX on, core at 19.2 MHz");
+	}
 	if (steps < 6) {
 		goto out;
 	}
@@ -1050,6 +1214,7 @@ step10:
 		wr(gpu + PC_DBG_ECO_CNTL, 0x00080000);
 		wr(gpu + CP_AHB_CNTL, 1);
 		wr(gpu + RBBM_PERFCTR_CNTL, 1);
+		wr(gpu + CP_PERFCTR_CP_SEL_0, PERF_CP_ALWAYS_COUNT);
 		wr(gpu + RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x3ffff);    /* the A610's */
 		wr(gpu + UCHE_CLIENT_PF, 1u << 7 | 1);
 		put64(gpu + CP_SQE_INSTR_BASE, core_address + CORE_SQE_OFFSET);
@@ -1080,6 +1245,7 @@ step10:
 		}
 		printf("a610: THE 3D CORE TAKES COMMANDS\n");
 		redwood_status(REDWOOD_STATUS_GPU, "command processor RUNS");
+		core_speed_measured();
 	}
 	if (steps < 12) {
 		goto out;
