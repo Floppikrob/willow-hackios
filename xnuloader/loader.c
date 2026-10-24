@@ -513,6 +513,18 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
+/*
+ * The one partition of a device that a write may reach (ufs_write=1): where the data of iOS lives,
+ * past the iOS volume and both cryptexes the build writes from the computer. Every field has to be
+ * what it was when the port was set up; one out of place and nothing is written that run.
+ */
+struct store_part {
+	const char *name;                /* its GPT name */
+	efi_guid type, uniq;             /* its type and unique GUIDs */
+	uint64_t first_lba, last_lba;    /* where it begins and ends on unit 0 */
+	uint32_t block_size;
+};
+
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
@@ -526,6 +538,7 @@ struct platform {
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
+	const struct store_part *store;  /* the partition a write may reach; NULL: none */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -540,6 +553,14 @@ static const struct platform platform_qemu_virt = {
 	.timeout_scale = 20,
 };
 
+/* darwin, the port's own 20 GiB at the end of logical unit 0 (README, "The port's partition") */
+static const struct store_part redwood_store = {
+	.name = "darwin",
+	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
+	.uniq = { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } },
+	.first_lba = 25374720, .last_lba = 30617594, .block_size = 4096,
+};
+
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
@@ -552,6 +573,7 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 	.fb_base = 0xE1000000,
+	.store = &redwood_store,
 };
 
 /*
@@ -559,6 +581,17 @@ static const struct platform platform_redwood = {
  * (Cortex-A53 class), cpu@100..103 the Gold ones (Cortex-A73 class). The firmware's PSCI is called with SMC.
  */
 static const uint32_t willow_core_mpidr[8] = { 0x000, 0x001, 0x002, 0x003, 0x100, 0x101, 0x102, 0x103 };
+
+/*
+ * system (mmcblk0p86), 10 GiB of the eMMC, which Android no longer has: the iOS volume and the
+ * cryptexes fill its first 8365539328 bytes (WILLOW_NOTES.md), the data of iOS goes behind them.
+ */
+static const struct store_part willow_store = {
+	.name = "system",
+	.type = { 0x97d7b011, 0x54da, 0x4835, { 0xb3, 0xc4, 0x91, 0x7a, 0xd6, 0xe7, 0x3d, 0x74 } },
+	.uniq = { 0xf3caeb92, 0xf746, 0xd6d9, { 0x37, 0xf5, 0xb0, 0x63, 0xf7, 0x85, 0x1e, 0x7a } },
+	.first_lba = 10059776, .last_lba = 31031295, .block_size = 512,
+};
 
 static const struct platform platform_willow = {
 	.name = "willow", .io_base = 0x00400000, .io_size = 0x3FC00000,
@@ -571,6 +604,7 @@ static const struct platform platform_willow = {
 	 */
 	.small_cores = 0xf0,
 	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
+	.store = &willow_store,
 };
 
 /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
@@ -1530,11 +1564,12 @@ ufs_survey(void)
  * bsd/dev/redwood_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
  * Reads, and -- with ufs_write=1 on the command line -- writes into one partition and nowhere
- * else: the port's own darwin, proved by its GPT entry (name, both GUIDs, first and last LBA, its
- * logical unit), and in it only past everything the build writes from the computer, so that no
- * answer to the kernel can reach Android's partitions, the iOS volume or the cryptexes. The
- * refusals are here, in the kernel (bsd/dev/redwood_ufs.c) and in UEFI's own driver, which gives
- * out a partition's BlockIo and bounds it: a request has to pass all three.
+ * else: the platform's store (darwin on redwood, system on willow), proved by its GPT entry
+ * (name, both GUIDs, first and last LBA, its logical unit), and in it only past everything the
+ * build writes from the computer, so that no answer to the kernel can reach Android's partitions,
+ * the iOS volume or the cryptexes. The refusals are here, in the kernel (bsd/dev/redwood_ufs.c)
+ * and in UEFI's own driver, which gives out a partition's BlockIo and bounds it: a request has to
+ * pass all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
  * table, once, before the kernel starts). A line one side cleans out of its cache therefore never
@@ -1552,18 +1587,13 @@ ufs_survey(void)
 #define BLOCK_OP_WRITE     1u
 
 /*
- * The one partition a write may reach, and from which of its blocks. darwin is the port's own
- * 20 GiB at the end of logical unit 0 (README, "The port's partition"); what the build puts there
- * from the computer (tools/darwin-write.py) is the iOS volume at its start and the two cryptexes
- * behind it, and nothing of this port reads or writes the rest -- so the data of iOS lives there
- * and a write is refused before that block. The identity is the whole of darwin-write.py's: the
- * same partition, named the same, of the same size, in the same place, on logical unit 0.
+ * From which block of the platform's store partition (struct store_part) a write may go: what the
+ * build puts there from the computer (tools/darwin-write.py) is the iOS volume at its start and the
+ * two cryptexes behind it, and nothing of this port reads or writes the rest -- so the data of iOS
+ * lives there and a write is refused before that block. Counted in blocks of 4096 whatever the
+ * partition's own (the shared page says it so); block_write_lba is the same in the partition's.
  */
-#define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
-#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+#define BLOCK_WRITE_FIRST  2042368ULL                  /* blocks of 4096: past both cryptexes */
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1649,6 +1679,7 @@ static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
+static uint64_t block_write_lba;        /* BLOCK_WRITE_FIRST in that partition's blocks */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
 /* the bytes of a device path before its end node */
@@ -1896,43 +1927,46 @@ block_tables(void)
 }
 
 /*
- * Is this partition the one a write may reach? Everything about it has to be what it was when the
- * port was set up; one field out of place and nothing is written this run. The name UEFI reports
- * is already in bp->name (ufs_name), in ASCII.
+ * Is this partition the one a write may reach (PLAT->store)? Everything about it has to be what it
+ * was when the port was set up; one field out of place and nothing is written this run. The name
+ * UEFI reports is already in bp->name (ufs_name), in ASCII.
  */
 static int
-block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
+block_is_store(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
-	static const char name[] = "darwin";
+	const struct store_part *sp = PLAT->store;
 	const char *why = NULL;
 
-	for (unsigned i = 0; i < sizeof(name); i++) {
-		if (bp->name[i] != name[i]) {
+	if (sp == NULL) {
+		return 0;
+	}
+	for (unsigned i = 0; i == 0 || sp->name[i - 1] != 0; i++) {
+		if (bp->name[i] != sp->name[i]) {
 			return 0;               /* another partition: nothing to say about it */
 		}
 	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+	if (memcmp(&info->type_guid, &sp->type, sizeof(sp->type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, &sp->uniq, sizeof(sp->uniq)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+	} else if (info->start_lba != sp->first_lba || info->end_lba != sp->last_lba) {
 		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+	} else if (bp->block_size != sp->block_size || bp->blocks != sp->last_lba - sp->first_lba + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
 	if (why != NULL) {
-		print("ufs: darwin: no write will be served: %s\n", why);
+		print("ufs: %s: no write will be served: %s\n", sp->name, why);
 		return 0;
 	}
-	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
-	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
+	block_write_lba = BLOCK_WRITE_FIRST * 4096 / sp->block_size;
+	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
+	    sp->name, info->start_lba, info->end_lba, block_write_lba);
 	return 1;
 }
 
@@ -2006,7 +2040,7 @@ block_start(void)
 				}
 			}
 		}
-		if (block_write_requested && block_is_darwin(info, bio, bp)) {
+		if (block_write_requested && block_is_store(info, bio, bp)) {
 			block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
@@ -2182,8 +2216,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
-				/* not darwin, or not past what the build writes from the computer: never */
+			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_lba) {
+				/* not the store, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
 					    block_shared.part[part].name);
@@ -2209,8 +2243,8 @@ block_poll(void)
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
-						print("ufs: %d blocks from %d of darwin read back DIFFERENT\n",
-						    count, lba);
+						print("ufs: %d blocks from %d of %s read back DIFFERENT\n",
+						    count, lba, block_shared.part[part].name);
 						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
 					}
 				}
@@ -3199,6 +3233,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = *c;
 		}
 	}
+	/* which phone this is, for the kernel's drivers of its buttons and touch screen (bsd/dev/redwood_buttons.c) */
+	for (const char *c = "device="; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+		ba->commandLine[n++] = *c;
+	}
+	for (const char *c = PLAT->name; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+		ba->commandLine[n++] = *c;
+	}
+	if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	if (block_enabled) {
 		static const char prefix[] = "ufs_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
@@ -3562,7 +3604,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
 	}
 	if (block_write_requested) {
-		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
+		print("ufs: %d writes into the store, %d bytes, read back the same; %d refused\n", block_writes,
 		    block_write_bytes, block_writes_refused);
 	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */

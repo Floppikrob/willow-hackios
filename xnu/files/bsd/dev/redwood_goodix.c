@@ -1508,6 +1508,14 @@ redwood_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	{
+		/* another phone (xnuloader's device=): its touch screen is another driver's (redwood_novatek.c) */
+		char device[16] = "";
+
+		if (PE_parse_boot_arg_str("device", device, sizeof(device)) && strcmp(device, "redwood") != 0) {
+			return;
+		}
+	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

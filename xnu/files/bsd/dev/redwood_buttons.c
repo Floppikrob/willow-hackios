@@ -1,7 +1,8 @@
 /*
  * The buttons of the POCO X5 Pro (redwood) -- power, volume up, volume down -- as a source of
  * button records for /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg buttons=1:
- * every address below belongs to this phone.
+ * every address below belongs to this phone -- or, with device=willow (which xnuloader puts on
+ * the command line of the Redmi Note 8T), to that one (struct board below).
  *
  * None of the three is a pin of the SoC. They are inputs of two of the power management chips:
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
@@ -93,12 +94,9 @@ wr(vm_offset_t address, uint32_t value)
 
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* "core": the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
-#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
+#define ARB_CORE_SIZE           0x1100UL        /* "core": the version, and which peripheral each channel is */
+#define ARB_CNFG_SIZE           0x1000UL        /* "cnfg": which system owns each channel */
+#define ARB_OBSERVER_SIZE       0x10000UL       /* "obsrvr": 0x10000 per system, 0x80 per channel in it; ours is the first */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
 #define ARB_VERSION             0x000
@@ -149,8 +147,31 @@ struct peripheral {
 	uint16_t        channel;
 	bool            found;
 };
-static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
-static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+static struct peripheral pon, pin;
+
+/*
+ * Where each phone has it all. The power-on block comes in two kinds: redwood's is split in two
+ * ("generation 3", its half for the operating system has the keys in bits 7 and 6), willow's
+ * PM6125 has the older one, all in one block, with the keys in bits 0 and 1 (Linux
+ * drivers/input/misc/qpnp-power-on.c: KPDPWR_N_SET, RESIN_N_SET).
+ */
+static const struct board {
+	const char *    device;         /* device= on the command line; redwood without one */
+	uint64_t        arb_core, arb_cnfg, arb_observer;
+	const char *    pon_name;
+	uint16_t        pon_id;         /* slave << 8 | peripheral */
+	uint8_t         pon_subtype_from, pon_subtype_to;
+	uint8_t         pon_power, pon_volume_down;     /* their bits in the status */
+	const char *    pin_name;
+	uint16_t        pin_id;
+} boards[] = {
+	{ "redwood", 0x0c440000, 0x0c40a000, 0x0e600000, "the PMK8350's power-on block", 0x013, 0x09, 0x09, 0x80, 0x40,
+	  "GPIO6 of the PM7325", 0x18d },
+	/* qcom,spmi@1c40000 of willow's device tree; qcom,power-on@800 of the PM6125, gpio_keys' GPIO5 of it */
+	{ "willow", 0x01c40000, 0x01c0a000, 0x03e00000, "the PM6125's power-on block", 0x008, 0x01, 0x05, 0x01, 0x02,
+	  "GPIO5 of the PM6125", 0x0c4 },
+};
+static const struct board *board = &boards[0];
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -245,11 +266,10 @@ find_channel(struct peripheral *p, uint32_t channels)
 #define REG_INT_LATCHED         0x18
 #define REG_INT_PENDING         0x19
 
-/* the power-on block, of the kind that is split in two ("generation 3"): this is its half for the operating system */
+/* the power-on block; which subtypes it may be and where its keys are in its status: struct board */
 #define PON_TYPE                0x01
-#define PON_SUBTYPE_HLOS        0x09
-#define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
-#define PON_RESIN               0x40
+#define PON_KPDPWR              board->pon_power        /* in the status and in the interrupt registers */
+#define PON_RESIN               board->pon_volume_down
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
@@ -386,7 +406,8 @@ pon_inputs(void)
 	const char *problem;
 	uint8_t r[8], more[2];
 
-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
+	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n", pon.name,
+	    pon.id & 0xff, pon.id & 0xff);
 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
@@ -412,7 +433,8 @@ pin_input(void)
 	uint8_t c[8], status = 0;
 	unsigned mode, pull;
 
-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
+	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n", pin.name,
+	    pin.id & 0xff, pin.id & 0xff, pin.id & 0xff);
 	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
@@ -453,11 +475,11 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
 	bool pon_known, pin_known;
 
-	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
-	    ARB_OBSERVER_PHYS);
-	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	printf("buttons: step 1 (%s): map the PMIC arbiter (%#llx, %#llx, %#llx) and read its version\n", board->device,
+	    board->arb_core, board->arb_cnfg, board->arb_observer);
+	arb_core = ml_io_map(board->arb_core, ARB_CORE_SIZE);
+	arb_cnfg = ml_io_map(board->arb_cnfg, ARB_CNFG_SIZE);
+	arb_observer = ml_io_map(board->arb_observer, ARB_OBSERVER_SIZE);
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
@@ -480,7 +502,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
+	pon_known = identify(&pon, PON_TYPE, board->pon_subtype_from, board->pon_subtype_to);
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
 	if (steps < 4) {
 		goto out;
@@ -553,6 +575,23 @@ redwood_buttons_init(void)
 	if (steps == 0) {
 		return;
 	}
+	{
+		char device[16] = "";
+
+		if (PE_parse_boot_arg_str("device", device, sizeof(device))) {
+			for (unsigned i = 0; i < sizeof(boards) / sizeof(boards[0]); i++) {
+				if (strcmp(device, boards[i].device) == 0) {
+					board = &boards[i];
+				}
+			}
+			if (strcmp(device, board->device) != 0) {
+				printf("buttons: device=%s is not a phone this driver knows: no buttons\n", device);
+				return;
+			}
+		}
+	}
+	pon = (struct peripheral){ .name = board->pon_name, .id = board->pon_id };
+	pin = (struct peripheral){ .name = board->pin_name, .id = board->pin_id };
 	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

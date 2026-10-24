@@ -14,8 +14,9 @@
  *
  * Read only wherever a write could do harm, by construction. The block devices never write: the
  * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
- * writing is refused. With ufs_write=1 one character device alone takes writes -- /dev/rufs_darwin,
- * the port's own partition -- and in it only whole blocks from UFS_WRITE_FIRST on, past the iOS
+ * writing is refused. With ufs_write=1 one character device alone takes writes -- the store,
+ * /dev/rufs_darwin on redwood and /dev/rufs_system on willow (ufs_stores below) -- and in it only
+ * whole blocks from UFS_WRITE_FIRST on, past the iOS
  * volume and both cryptexes that the build writes from the computer (tools/darwin-write.py); that
  * is where the data volume of iOS is kept between runs (userland/src/var_store.c). The partition
  * has to be the one the port was set up with (its name, size, place and logical unit here; its
@@ -70,14 +71,21 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define BLOCK_OP_WRITE     1u
 
 /*
- * Where a write may go, and nowhere else: darwin, the port's own 20 GiB at the end of logical
- * unit 0, and in it only past what the build puts there from the computer -- the iOS volume
- * (blocks 0..1374207) and the two cryptexes behind it (..2042367). The loader keeps the same
- * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
+ * Where a write may go, and nowhere else: the store, one partition of logical unit 0 for each
+ * device, and in it only past what the build puts there from the computer -- the iOS volume
+ * (bytes 0..5628755967) and the two cryptexes behind it (..8365539327). The loader keeps the same
+ * bounds and the GUIDs of the partition besides (xnuloader/loader.c, struct store_part).
  */
-#define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
-#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
-#define UFS_DARWIN_BLOCKS  5242875ULL
+#define UFS_WRITE_FIRST    2042368ULL                  /* in blocks of 4096, whatever the partition's own */
+
+static const struct ufs_store {
+	const char *name;
+	uint64_t first_lba, blocks;     /* where it begins on the unit and how long, as the GPT has it */
+	uint32_t block_size;
+} ufs_stores[] = {
+	{ "darwin", 25374720, 5242875, 4096 },          /* redwood: the port's own 20 GiB at the end of unit 0 */
+	{ "system", 10059776, 20971520, 512 },          /* willow: Android's 10 GiB of the eMMC, mmcblk0p86 */
+};
 
 struct loader_block_part {
 	char name[36];
@@ -204,6 +212,7 @@ static int ufs_var_busy_pid;
 
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
 static int ufs_write_part = -1;
+static char ufs_store_name[32];                 /* its name, for kern.redwood.ufs_store: "" if none */
 static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
 static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
@@ -220,13 +229,15 @@ SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_writes,
-    "requests written into darwin and read back by the loader");
+    "requests written into the store and read back by the loader");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_bytes,
-    "bytes written into darwin");
+    "bytes written into the store");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_errors,
     "writes the loader refused or did not finish");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_refused,
-    "writes refused here: not darwin, or not past what the build writes");
+    "writes refused here: not the store, or not past what the build writes");
+SYSCTL_STRING(_kern_redwood, OID_AUTO, ufs_store, CTLFLAG_RD | CTLFLAG_LOCKED, ufs_store_name, 0,
+    "the partition that takes writes this run (/dev/rufs_NAME), empty if none");
 
 /* The handshake: 1 to register as the saver, 3 to say the volume is in the flash. 2 is the kernel's. */
 static int
@@ -291,7 +302,7 @@ ufs_sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unu
 }
 
 SYSCTL_PROC(_kern_redwood, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_darwin must hold: 1 takes it, 0 gives it back");
+    ufs_sysctl_var_busy, "I", "the claim a writer of the store must hold: 1 takes it, 0 gives it back");
 
 /*
  * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
@@ -428,7 +439,7 @@ redwood_ufs_report(const char *when)
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
-		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
+		printf("ufs: %s: %llu writes into the store, %llu bytes, read back by the loader; %llu did not "
 		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
 		    ufs_write_refused);
 	}
@@ -576,7 +587,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	if (offset < UFS_WRITE_FIRST * 4096 || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -598,7 +609,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 		ufs_write_out = true;
 		if (ufs_write_was_native) {
 			ufs_native_on = false;
-			ufs_native_out("writing the data volume into darwin");
+			ufs_native_out("writing the data volume into the store");
 		}
 	}
 	while (len > 0 && error == 0) {
@@ -673,7 +684,7 @@ ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused
 
 static void ufs_write_restore(void);
 
-/* The last close of /dev/rufs_darwin ends the writing: this kernel's own transfer list goes back in. */
+/* The last close of the store ends the writing: this kernel's own transfer list goes back in. */
 static int
 ufs_cclose(dev_t dev, int flags, int devtype, proc_t p)
 {
@@ -1492,9 +1503,9 @@ redwood_ufs_init(void)
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 
 	/*
-	 * ufs_write=1: /dev/rufs_darwin takes writes, past the iOS volume and the cryptexes. darwin
-	 * has to be the partition the port was set up with, in everything the loader's table says of
-	 * it; the loader looks at its GUIDs besides, and refuses the same bounds of its own accord.
+	 * ufs_write=1: the store takes writes, past the iOS volume and the cryptexes. It has to be
+	 * one of ufs_stores, the partition the port was set up with, in everything the loader's table
+	 * says of it; the loader looks at its GUIDs besides, and refuses the same bounds of its own accord.
 	 */
 	check = 0;
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
@@ -1505,9 +1516,15 @@ redwood_ufs_init(void)
 			    "line too, and a loader that knows about writes)\n");
 		}
 		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
+			const struct ufs_store *st = NULL;
 			const char *why = NULL;
 
-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
+			for (uint32_t k = 0; k < sizeof(ufs_stores) / sizeof(ufs_stores[0]); k++) {
+				if (strncmp((const char *)ufs_page->part[i].name, ufs_stores[k].name, 32) == 0) {
+					st = &ufs_stores[k];
+				}
+			}
+			if (st == NULL) {
 				continue;
 			}
 			if (i != offered - 1) {
@@ -1519,25 +1536,26 @@ redwood_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_page->part[i].start_lba != st->first_lba) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != st->blocks) {
 				why = "it is not the size it was";
-			} else if (ufs_page->part[i].block_size != 4096) {
-				why = "its blocks are not 4096 bytes";
+			} else if (ufs_page->part[i].block_size != st->block_size) {
+				why = "its blocks are not the size they were";
 			}
 			if (why != NULL) {
-				printf("ufs: darwin: no write will be asked for: %s\n", why);
+				printf("ufs: %s: no write will be asked for: %s\n", st->name, why);
 				continue;
 			}
 			ufs_write_part = (int)i;
+			strlcpy(ufs_store_name, st->name, sizeof(ufs_store_name));
 		}
 		if (ufs_write_part >= 0) {
-			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			printf("ufs: /dev/rufs_%s takes writes, whole blocks from byte %llu on (%llu MB of it); "
+			    "everything else of the storage is read only\n", ufs_store_name, UFS_WRITE_FIRST * 4096,
+			    (ufs_part_bytes((uint32_t)ufs_write_part) - UFS_WRITE_FIRST * 4096) >> 20);
 		} else {
-			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+			printf("ufs: nothing takes writes: no store among the partitions\n");
 		}
 	}
 
