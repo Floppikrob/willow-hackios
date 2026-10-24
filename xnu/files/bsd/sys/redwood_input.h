@@ -74,6 +74,13 @@ void redwood_battery_report(const struct redwood_battery_state *state);
 void redwood_net_init(void);            /* en0, if there is something to carry its frames: sys/redwood_net.h */
 void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
+/* the panel over the picture (fb_hud=1): a line for each part of the phone, said by its driver (redwood_status.c) */
+enum { REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_CPU, REDWOOD_STATUS_MEMORY, REDWOOD_STATUS_GPU, REDWOOD_STATUS_TOUCH,
+       REDWOOD_STATUS_KEYS, REDWOOD_STATUS_STORAGE, REDWOOD_STATUS_WIFI, REDWOOD_STATUS_SOUND, REDWOOD_STATUS_BATTERY,
+       REDWOOD_STATUS_PARTS };
+void redwood_status(unsigned part, const char *format, ...) __printflike(2, 3);
+bool redwood_status_line(unsigned part, char *line, size_t size);
+void redwood_a610_init(void);          /* boot-arg a610=N with device=willow: the same for the Note 8T's Adreno 610 */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */

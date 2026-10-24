@@ -382,6 +382,8 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 		/* the loader has read the blocks back and found them the same */
 		ufs_writes++;
 		ufs_write_bytes += bytes;
+		redwood_status(REDWOOD_STATUS_STORAGE, "ok; /var saved into %s, %llu MB written", ufs_store_name,
+		    ufs_write_bytes >> 20);
 		return 0;
 	}
 	started = mach_absolute_time();
@@ -1499,6 +1501,7 @@ redwood_ufs_init(void)
 		made++;
 	}
 	ufs_ready = true;
+	redwood_status(REDWOOD_STATUS_STORAGE, "ok, %u partitions, read through the loader", made);
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 
@@ -1551,6 +1554,7 @@ redwood_ufs_init(void)
 			strlcpy(ufs_store_name, st->name, sizeof(ufs_store_name));
 		}
 		if (ufs_write_part >= 0) {
+			redwood_status(REDWOOD_STATUS_STORAGE, "ok, %u partitions; /var kept in %s", made, ufs_store_name);
 			printf("ufs: /dev/rufs_%s takes writes, whole blocks from byte %llu on (%llu MB of it); "
 			    "everything else of the storage is read only\n", ufs_store_name, UFS_WRITE_FIRST * 4096,
 			    (ufs_part_bytes((uint32_t)ufs_write_part) - UFS_WRITE_FIRST * 4096) >> 20);

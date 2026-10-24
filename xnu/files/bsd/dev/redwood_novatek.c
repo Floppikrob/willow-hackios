@@ -743,6 +743,8 @@ nvt_poll(void)
 			fingers[id] = (struct finger){ .down = true, .x = x, .y = y };
 			redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);
 			posted++;
+			redwood_status(REDWOOD_STATUS_TOUCH, "ok, finger %u at %u,%u; %llu events", id, x * max_x / 65535,
+			    y * max_y / 65535, posted);
 			if (posted <= 20) {
 				printf("novatek: finger %u down at %u, %u (of 65535)\n", id, x, y);
 			}
@@ -776,6 +778,7 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 	se = ml_io_map(SE_PHYS, SE_SIZE);
 
+	redwood_status(REDWOOD_STATUS_TOUCH, "starting");
 	printf("novatek: the pins as the firmware left them\n");
 	for (unsigned pin = PIN_SPI_FIRST; pin < PIN_SPI_FIRST + 4; pin++) {
 		gpio_describe("SPI", pin);
@@ -784,6 +787,7 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 	gpio_describe("interrupt", PIN_INT);
 
 	if (!clocks_on()) {
+		redwood_status(REDWOOD_STATUS_TOUCH, "FAILED: SPI clocks stay off");
 		goto out;
 	}
 	for (unsigned pin = PIN_SPI_FIRST; pin < PIN_SPI_FIRST + 4; pin++) {
@@ -793,6 +797,7 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 	problem = geni_spi_init(4000000);
 	if (problem != NULL) {
 		printf("novatek: %s: no touch screen\n", problem);
+		redwood_status(REDWOOD_STATUS_TOUCH, "FAILED: %s", problem);
 		goto out;
 	}
 	/* as the vendor's probe: the "engineering" reset, the reset line high, 10 ms; then which chip it is */
@@ -805,6 +810,7 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	sleep_ms(10);
 	if (!nvt_check_chip()) {
+		redwood_status(REDWOOD_STATUS_TOUCH, "FAILED: no NT36672A answers");
 		goto out;
 	}
 	{
@@ -814,9 +820,9 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 		if (fw == NULL) {
 			printf("novatek: no fw/novatek_ts_fw.bin in the small image: put the phone's "
 			    "/vendor/firmware/novatek_ts_tianma_fw.bin into fw-touch/ as novatek_ts_fw.bin and run userland/build.sh\n");
-			goto out;
 		}
-		if (!nvt_download(fw, size)) {
+		if (fw == NULL || !nvt_download(fw, size)) {
+			redwood_status(REDWOOD_STATUS_TOUCH, "FAILED: %s", fw == NULL ? "no firmware file" : "firmware did not start");
 			goto out;
 		}
 	}
@@ -826,6 +832,7 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 
 	printf("novatek: watching, every %u us\n", poll_us);
+	redwood_status(REDWOOD_STATUS_TOUCH, "ok, NT36672A, %u Hz", 1000000 / poll_us);
 	for (unsigned tick = 1;; tick++) {
 		nvt_poll();
 		if (tick == 1) {
@@ -841,6 +848,7 @@ novatek_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (failures >= 1000 && failures * 2 > reports) {
 			printf("novatek: more than half of the reads have failed: giving up\n");
+			redwood_status(REDWOOD_STATUS_TOUCH, "FAILED: reads fail, gave up");
 			break;
 		}
 		delay_for_interval(poll_us, NSEC_PER_USEC);

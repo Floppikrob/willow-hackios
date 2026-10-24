@@ -338,6 +338,7 @@ button_look(struct button *b, bool pressed)
 		b->since = now;
 		b->presses++;
 		printf("buttons: %s PRESSED at %s\n", b->name, when);
+		redwood_status(REDWOOD_STATUS_KEYS, "ok, %s pressed (%u times)", b->name, b->presses);
 	} else {
 		absolutetime_to_nanoseconds(now - b->since, &held);
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);
@@ -517,6 +518,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 	if (!power.usable && !volume_up.usable) {
 		printf("buttons: nothing that can be read: no buttons\n");
+		redwood_status(REDWOOD_STATUS_KEYS, "FAILED: nothing readable");
 		goto out;
 	}
 	if (power.last || volume_down.last || volume_up.last) {
@@ -532,6 +534,8 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 
+	redwood_status(REDWOOD_STATUS_KEYS, "ok:%s%s%s", power.usable ? " power" : "", volume_up.usable ? " vol+" : "",
+	    volume_down.usable ? " vol-" : "");
 	printf("buttons: step 5: watching%s%s%s, every %u ms: power is the side button\n", power.usable ? " power" : "",
 	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
 	for (unsigned tick = 1;; tick++) {

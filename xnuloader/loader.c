@@ -1043,6 +1043,12 @@ static uint64_t sound_len;
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
+/*
+ * note_seconds=N: so much longer, for a run whose question comes later than 24 s and may end in a
+ * reset (the GPU's first commands come some 35 s in). UEFI keeps its interrupts on this core as
+ * long, while the kernel has the interrupt controller's shared half: a while, not a whole run.
+ */
+static uint64_t note_seconds = NOTE_SECONDS;
 
 static void wdt_pet(void);
 static int wdt_armed;
@@ -2425,7 +2431,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * After that this core only watches: no interrupts (the kernel reprograms the interrupt
 		 * controller's shared half; UEFI's handlers had better not run on top of that for long).
 		 */
-		if (!watching_only && seconds_since(started) >= NOTE_SECONDS) {
+		if (!watching_only && seconds_since(started) >= note_seconds) {
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
 			__asm__ volatile ("msr daifset, #0xf");
@@ -2855,6 +2861,237 @@ choose_window(const struct payload_info *pi)
  */
 static int starts_with(const char *s, const char *prefix);
 
+/*
+ * uefi_clock=NAME[,NAME...] on the command line: clocks switched on through Qualcomm's own clock
+ * driver in this UEFI (ClockDxe, EFI_CLOCK_PROTOCOL), before the kernel starts. That driver knows
+ * the clocks this kernel cannot switch on itself: the ones the RPM owns, which it asks for over
+ * GLINK (NpaDxe, GLinkDxe) -- on willow the crypto engine's core clock, gcc_ce1_clk, without which
+ * TrustZone checks no signature. What is switched on stays on for the run.
+ */
+struct efi_clock_protocol {
+	uint64_t version;
+	efi_status (EFIAPI *get_clock_id)(struct efi_clock_protocol *self, const char *name, uint64_t *id);
+	efi_status (EFIAPI *enable_clock)(struct efi_clock_protocol *self, uint64_t id);
+	efi_status (EFIAPI *disable_clock)(struct efi_clock_protocol *self, uint64_t id);
+	efi_status (EFIAPI *is_clock_enabled)(struct efi_clock_protocol *self, uint64_t id, uint8_t *enabled);
+	efi_status (EFIAPI *is_clock_on)(struct efi_clock_protocol *self, uint64_t id, uint8_t *on);
+	efi_status (EFIAPI *set_clock_freq_hz)(struct efi_clock_protocol *self, uint64_t id, uint32_t freq, uint32_t match,
+	    uint32_t *result);
+	efi_status (EFIAPI *get_clock_freq_hz)(struct efi_clock_protocol *self, uint64_t id, uint32_t *freq);
+	void *calc_clock_freq_hz, *select_external_source, *get_power_domain_id, *enable_power_domain,
+	    *disable_power_domain, *enter_low_power_mode, *exit_low_power_mode, *set_clock_divider, *reset_clock;
+	/* the processor's clocks (EFIClock.h, protocol version 0x10009; this UEFI's says which it is) */
+	efi_status (EFIAPI *get_max_perf_level)(struct efi_clock_protocol *self, uint32_t cpu, uint32_t *level);
+	efi_status (EFIAPI *get_min_perf_level)(struct efi_clock_protocol *self, uint32_t cpu, uint32_t *level);
+	efi_status (EFIAPI *get_cpu_perf_level_frequency)(struct efi_clock_protocol *self, uint32_t cpu, uint32_t level,
+	    uint32_t *hz, uint32_t *microvolts);
+	efi_status (EFIAPI *set_cpu_perf_level)(struct efi_clock_protocol *self, uint32_t cpu, uint32_t level, uint32_t *hz);
+	efi_status (EFIAPI *get_cpu_perf_level)(struct efi_clock_protocol *self, uint32_t cpu, uint32_t *level);
+};
+
+/*
+ * uefi_cpu=probe: what the UEFI clock driver says of each core's clock -- its performance levels,
+ * the frequency and voltage of each, the level it is at -- and nothing is changed. The protocol
+ * here is older than the header these entries are taken from, so an entry is only called when it
+ * points where the driver's other entries do (into the same image); otherwise it is not there.
+ */
+static int
+uefi_entry_plausible(const struct efi_clock_protocol *clock, const void *entry)
+{
+	uint64_t a = (uint64_t)(uintptr_t)clock->get_clock_id, b = (uint64_t)(uintptr_t)entry;
+
+	return entry != NULL && (b > a ? b - a : a - b) < 0x100000;
+}
+
+static void
+uefi_cpu_probe(struct efi_clock_protocol *clock)
+{
+	if (!uefi_entry_plausible(clock, clock->get_max_perf_level) || !uefi_entry_plausible(clock, clock->get_cpu_perf_level) ||
+	    !uefi_entry_plausible(clock, clock->get_cpu_perf_level_frequency)) {
+		print("uefi cpu: the processor's entries are not in this protocol (%x %x %x): nothing asked\n",
+		    (uint64_t)(uintptr_t)clock->get_max_perf_level, (uint64_t)(uintptr_t)clock->get_cpu_perf_level,
+		    (uint64_t)(uintptr_t)clock->get_cpu_perf_level_frequency);
+		return;
+	}
+	for (uint32_t cpu = 0; cpu < 8; cpu++) {
+		uint32_t max = 0, min = 0, now = 0;
+		efi_status a = clock->get_max_perf_level(clock, cpu, &max);
+		efi_status b = clock->get_min_perf_level(clock, cpu, &min);
+		efi_status c = clock->get_cpu_perf_level(clock, cpu, &now);
+
+		print("uefi cpu %d: levels %d to %d (%x %x), now %d (%x)\n", (uint64_t)cpu, (uint64_t)min, (uint64_t)max, a, b,
+		    (uint64_t)now, c);
+		if (EFI_ERROR(a) || max > 32) {
+			continue;
+		}
+		for (uint32_t level = min; level <= max; level++) {
+			uint32_t hz = 0, uv = 0;
+
+			if (!EFI_ERROR(clock->get_cpu_perf_level_frequency(clock, cpu, level, &hz, &uv))) {
+				print("uefi cpu %d: level %d: %d MHz at %d mV\n", (uint64_t)cpu, (uint64_t)level, (uint64_t)(hz / 1000000),
+				    (uint64_t)(uv / 1000));
+			}
+		}
+	}
+}
+
+static void
+uefi_clocks(const char *cmdline)
+{
+	static const efi_guid clock_guid = { 0x241afae6, 0x885f, 0x4f6c, { 0xa7, 0xea, 0xc2, 0x8e, 0xab, 0x79, 0xc3, 0xe5 } };
+	struct efi_clock_protocol *clock = NULL;
+	const char *c;
+
+	for (c = cmdline; *c; c++) {
+		if (starts_with(c, "uefi_clock=") && (c == cmdline || c[-1] == ' ')) {
+			break;
+		}
+	}
+	if (*c == 0) {
+		for (c = cmdline; *c; c++) {
+			if (starts_with(c, "uefi_cpu=probe") && (c == cmdline || c[-1] == ' ')) {
+				if (!EFI_ERROR(BS->locate_protocol(&clock_guid, NULL, (void **)&clock)) && clock != NULL) {
+					print("uefi clock: the clock protocol, version %x\n", clock->version);
+					uefi_cpu_probe(clock);
+				}
+				break;
+			}
+		}
+		return;
+	}
+	if (EFI_ERROR(BS->locate_protocol(&clock_guid, NULL, (void **)&clock)) || clock == NULL) {
+		print("uefi clock: this UEFI has no clock protocol: nothing switched on\n");
+		return;
+	}
+	print("uefi clock: the clock protocol, version %x\n", clock->version);
+	for (c += 11; *c && *c != ' ';) {
+		char name[48];
+		unsigned n = 0;
+		uint64_t id = 0;
+		uint8_t on = 0;
+		uint32_t hz = 0;
+		efi_status st;
+
+		while (*c && *c != ' ' && *c != ',' && n + 1 < sizeof(name)) {
+			name[n++] = *c++;
+		}
+		name[n] = 0;
+		if (*c == ',') {
+			c++;
+		}
+		if (n == 0) {
+			continue;
+		}
+		st = clock->get_clock_id(clock, name, &id);
+		if (EFI_ERROR(st)) {
+			print("uefi clock: %s: no such clock (%x)\n", name, st);
+			continue;
+		}
+		clock->is_clock_on(clock, id, &on);
+		print("uefi clock: %s (id %x) is %s; switching it on\n", name, id, on ? "on" : "off");
+		st = clock->enable_clock(clock, id);
+		on = 0;
+		clock->is_clock_on(clock, id, &on);
+		clock->get_clock_freq_hz(clock, id, &hz);
+		print("uefi clock: %s: enable says %x; now %s, %d Hz\n", name, st, on ? "ON" : "still off", (uint64_t)hz);
+	}
+}
+
+/*
+ * uefi_npa=RESOURCE:VALUE on the command line: a "required" request on a resource of Qualcomm's
+ * power framework (NPA) in this UEFI (NpaDxe), which passes it on to the RPM -- on willow /clk/ce1,
+ * the crypto engine's core clock in kHz, which ClockDxe does not name as a clock and which
+ * TrustZone needs on to check a signature. The client stays for the run: the request with it.
+ */
+struct efi_npa_protocol {
+	uint64_t revision;
+	efi_status (EFIAPI *init)(void);
+	efi_status (EFIAPI *create_sync_client_ex)(const char *resource, const char *client, uint32_t type, uint32_t value,
+	    void *ref, void **handle);
+	efi_status (EFIAPI *complete_request)(void *handle);
+	efi_status (EFIAPI *define_node_cb)(void *node, void *initial, void *callback, void *context);
+	efi_status (EFIAPI *scalar_request)(void *handle, uint32_t state);
+};
+
+static void
+uefi_npa(const char *cmdline)
+{
+	static const efi_guid npa_guid = { 0x79d6c870, 0x725e, 0x489e, { 0xa0, 0xa1, 0x27, 0xe7, 0xa5, 0xd0, 0xcb, 0x35 } };
+	static char resource[48];
+	struct efi_npa_protocol *npa = NULL;
+	const char *c;
+	uint32_t value = 0;
+	unsigned n = 0;
+	void *client = NULL;
+	efi_status st = 0;
+
+	for (c = cmdline; *c; c++) {
+		if (starts_with(c, "uefi_npa=") && (c == cmdline || c[-1] == ' ')) {
+			break;
+		}
+	}
+	if (*c == 0) {
+		return;
+	}
+	for (c += 9; *c && *c != ':' && *c != ' ' && n + 1 < sizeof(resource); c++) {
+		resource[n++] = *c;
+	}
+	resource[n] = 0;
+	for (c += *c == ':'; *c >= '0' && *c <= '9'; c++) {
+		value = value * 10 + (uint32_t)(*c - '0');
+	}
+	if (EFI_ERROR(BS->locate_protocol(&npa_guid, NULL, (void **)&npa)) || npa == NULL) {
+		print("uefi npa: this UEFI has no NPA protocol: nothing asked for\n");
+		return;
+	}
+	print("uefi npa: the NPA protocol, revision %x; a client of %s\n", npa->revision, resource);
+	/* NPA_CLIENT_REQUIRED: bit 6 in the framework's header, bit 8 where it has two more custom types */
+	for (unsigned bit = 6; bit <= 8 && client == NULL; bit += 2) {
+		st = npa->create_sync_client_ex(resource, "xnuloader", 1u << bit, 0, NULL, &client);
+		print("uefi npa: client of type %x: %x, handle %x\n", (uint64_t)(1u << bit), st, (uint64_t)(uintptr_t)client);
+		if (EFI_ERROR(st)) {
+			client = NULL;
+		}
+	}
+	if (client == NULL) {
+		return;
+	}
+	st = npa->scalar_request(client, value);
+	print("uefi npa: %s = %d asked for: %x\n", resource, (uint64_t)value, st);
+}
+
+/*
+ * osmdump=1 (willow): every word of both clusters' OSM (0xf521000 Silver, 0xf523000 Gold) that is
+ * not the frequency table, side by side, where the two differ -- what the firmware has set up for
+ * the Gold cluster, whose OSM it leaves off (enable 2 against Silver's 3). Read only.
+ */
+static void
+osm_dump(void)
+{
+	volatile uint32_t *silver = (volatile uint32_t *)(uintptr_t)0x0F521000ULL;
+	volatile uint32_t *gold = (volatile uint32_t *)(uintptr_t)0x0F523000ULL;
+	unsigned same = 0, differ = 0;
+
+	print("osm dump: offset: Silver / Gold (words that differ; the table 0x110..0x30f left out)\n");
+	for (uint32_t off = 0; off < 0x1400; off += 4) {
+		uint32_t a, b;
+
+		if (off >= 0x110 && off < 0x310) {
+			continue;
+		}
+		a = silver[off / 4];
+		b = gold[off / 4];
+		if (a == b) {
+			same++;
+			continue;
+		}
+		differ++;
+		print("osm %x: %x / %x\n", (uint64_t)off, (uint64_t)a, (uint64_t)b);
+	}
+	print("osm dump: %d words the same, %d differ; LMh limit (0x704): Silver %d MHz, Gold %d MHz\n", (uint64_t)same,
+	    (uint64_t)differ, (uint64_t)((silver[0x704 / 4] & 0x3ff) * 192 / 10), (uint64_t)((gold[0x704 / 4] & 0x3ff) * 192 / 10));
+}
+
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -3044,6 +3281,29 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * does) -- and osm=2 both at their top (Silver 1804, Gold 2016). Without it the firmware's state
 	 * stays: Gold at 300 MHz (row 0), and the Gold cores the slower ones.
 	 */
+	uefi_clocks(pi.cmdline);
+	uefi_npa(pi.cmdline);
+	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "note_seconds=") && (c == pi.cmdline || c[-1] == ' ')) {
+			note_seconds = 0;
+			for (c += 13; *c >= '0' && *c <= '9'; c++) {
+				note_seconds = note_seconds * 10 + (uint64_t)(*c - '0');
+			}
+			if (note_seconds < NOTE_SECONDS || note_seconds > 120) {
+				note_seconds = NOTE_SECONDS;
+			}
+			print("the kernel's progress goes to logdump as it happens for %d s\n", note_seconds);
+			break;
+		}
+	}
+	if (PLAT == &platform_willow) {
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "osmdump=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				osm_dump();
+				break;
+			}
+		}
+	}
 	small_cores_now = PLAT->small_cores;
 	if (PLAT == &platform_willow) {
 		for (const char *c = pi.cmdline; *c; c++) {

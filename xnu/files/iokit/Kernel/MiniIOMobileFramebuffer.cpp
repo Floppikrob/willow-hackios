@@ -162,6 +162,19 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+/*
+ * Boot-arg fb_hud=1: a panel over the top of every frame, a line for each part of the phone as its
+ * driver says it is (bsd/dev/redwood_status.c) and one for the screen itself: frames a second, how
+ * long iOS took between two of them and how long this driver took to show one. For looking at the
+ * phone while it runs; the log says all of it as well.
+ */
+static TUNABLE(uint32_t, gHud, "fb_hud", 0);
+extern "C" {
+extern unsigned char iso_font[256 * 16];
+enum { kStatusScreen = 0, kStatusParts = 10 };  /* REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_PARTS (sys/redwood_input.h) */
+void redwood_status(unsigned part, const char *format, ...) __printflike(2, 3);
+bool redwood_status_line(unsigned part, char *line, size_t size);
+}
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned
@@ -304,6 +317,12 @@ public:
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	void drawHud(uint64_t began);
+	uint64_t        fHudLast;               /* drawHud(): when the frame before was shown */
+	uint64_t        fHudSecond;             /* ... the second being counted, and its frames */
+	uint32_t        fHudFrames, fHudFps, fHudIntervalUs, fHudDriverUs;
+	uint32_t *      fHudPixels;             /* ... the panel as last drawn, copied into every frame */
+	uint64_t        fHudDrawn;              /* ... when it was drawn: twice a second */
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
@@ -715,6 +734,80 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 }
 
 /*
+ * The panel of fb_hud=1, over the frame just put in the panel's memory: the font of the text
+ * console, twice its size. Working the letters out pixel by pixel costs some 15 ms on these cores,
+ * so that is done twice a second into a buffer, and every frame only copies the buffer's rows.
+ */
+void
+IOMobileFramebuffer::drawHud(uint64_t began)
+{
+	const uint32_t scale = 2, cell_w = 8 * scale, cell_h = 16 * scale + 2, left = 24, top = 110, columns = 64;
+	const uint32_t width = columns * cell_w, height = kStatusParts * cell_h;
+	uint64_t now = mach_absolute_time(), ns;
+	char line[80];
+
+	/* the screen's own line: frames in the last whole second, the time between this frame and the last, this driver's */
+	absolutetime_to_nanoseconds(now - began, &ns);
+	fHudDriverUs = (uint32_t) (ns / 1000);
+	if (fHudLast != 0) {
+		absolutetime_to_nanoseconds(now - fHudLast, &ns);
+		fHudIntervalUs = (uint32_t) (ns / 1000);
+	}
+	fHudLast = now;
+	fHudFrames++;
+	absolutetime_to_nanoseconds(now - fHudSecond, &ns);
+	if (fHudSecond == 0 || ns >= NSEC_PER_SEC) {
+		fHudFps = fHudSecond == 0 ? 0 : (uint32_t) ((uint64_t) fHudFrames * NSEC_PER_SEC / ns);
+		fHudFrames = 0;
+		fHudSecond = now;
+	}
+	redwood_status(kStatusScreen, "%u fps; %u ms a frame, %u ms of it showing it", fHudFps, fHudIntervalUs / 1000,
+	    fHudDriverUs / 1000);
+	if (left + width > fPanelWidth || top + height > fPanelHeight) {
+		return;
+	}
+	if (fHudPixels == NULL) {
+		fHudPixels = IONew(uint32_t, width * height);
+		if (fHudPixels == NULL) {
+			return;
+		}
+		fHudDrawn = 0;
+	}
+	absolutetime_to_nanoseconds(now - fHudDrawn, &ns);
+	if (fHudDrawn != 0 && ns < NSEC_PER_SEC / 2) {
+		goto copy;
+	}
+	fHudDrawn = now;
+
+	for (unsigned part = 0; part < kStatusParts; part++) {
+		uint32_t y0 = part * cell_h;
+
+		if (!redwood_status_line(part, line, sizeof(line))) {
+			break;
+		}
+		size_t length = strlen(line);
+		/* white on dark grey, a line that says FAILED in yellow (the panel's memory is not read back: it is slow to read) */
+		uint32_t ink_colour = strnstr(line, "FAILED", sizeof(line)) != NULL ? 0xffffff00u : 0xffffffffu, paper = 0xff181818u;
+
+		for (uint32_t y = y0; y < y0 + cell_h; y++) {
+			uint32_t * row = fHudPixels + (size_t) y * width;
+			uint32_t gy = (y - y0) / scale;
+
+			for (uint32_t x = 0; x < width; x++) {
+				uint32_t column = x / cell_w, gx = x % cell_w / scale;
+				unsigned char ch = column < length ? (unsigned char) line[column] : ' ';
+
+				row[x] = gy < 16 && (iso_font[ch * 16 + gy] >> gx & 1) ? ink_colour : paper;
+			}
+		}
+	}
+copy:
+	for (uint32_t y = 0; y < height; y++) {
+		memcpy(fBase + (size_t) (top + y) * fRowBytes + left * 4, fHudPixels + (size_t) y * width, width * 4);
+	}
+}
+
+/*
  * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
  * panel may be of another size, and the layer itself may be scaled: both are done in one
  * step, bilinear (or nearest neighbour: fb_filter=0).
@@ -1041,6 +1134,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 		}
+	}
+	if (gHud && fGraphics) {
+		drawHud(began);
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {

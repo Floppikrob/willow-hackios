@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..85f3c2114f7d 100644
+index 44274016a4cf..a88db3cb054f 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -73,6 +73,8 @@ index 44274016a4cf..85f3c2114f7d 100644
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_novatek.c	standard
++bsd/dev/redwood_a610.c		standard
++bsd/dev/redwood_status.c	standard
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_ufs.c	standard
@@ -104,7 +106,7 @@ index 44274016a4cf..85f3c2114f7d 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -119,7 +121,7 @@ index 44274016a4cf..85f3c2114f7d 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +403,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -127,7 +129,7 @@ index 44274016a4cf..85f3c2114f7d 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +426,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1879,7 +1881,7 @@ index 0316792a3f42..bbef0a4b26d4 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..722c74face07 100644
+index e26a1d70f470..24a7f2cccf28 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -1892,7 +1894,7 @@ index e26a1d70f470..722c74face07 100644
  
  #include <console/serial_protos.h>
  
-@@ -169,6 +172,95 @@ SECURITY_READ_ONLY_LATE(uint64_t) gDramBase;
+@@ -169,6 +172,106 @@ SECURITY_READ_ONLY_LATE(uint64_t) gDramBase;
  SECURITY_READ_ONLY_LATE(uint64_t) gDramSize;
  
  SECURITY_READ_ONLY_LATE(bool) serial_console_enabled = false;
@@ -1963,6 +1965,8 @@ index e26a1d70f470..722c74face07 100644
 +	kprintf("osm: cluster %u's cores ask for row %u of the OSM at %llx\n", osm_cluster, osm_row, base);
 +}
 +
++uint32_t redwood_cpu_mhz[8];
++
 +static void
 +cpu_speed_probe(void)
 +{
@@ -1981,6 +1985,15 @@ index e26a1d70f470..722c74face07 100644
 +		sum += i * i;
 +	}
 +	t2 = __builtin_arm_rsr64("CNTVCT_EL0");
++	{
++		/* for the panel (bsd/dev/redwood_status.c): the loop takes two cycles a round on these cores */
++		uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++		unsigned core = (unsigned)((mpidr >> 8 & 0xff) * 4 + (mpidr & 0xff));
++
++		if (core < 8 && t1 != t0) {
++			redwood_cpu_mhz[core] = (uint32_t)(2 * 10000000ULL * f / (t1 - t0) / 1000000);
++		}
++	}
 +	kprintf("cpuprobe: mpidr %llx sctlr %llx: 10M register adds %llu us (%llu MHz if one a cycle), 1M rounds of cpu_test %llu us\n",
 +	    __builtin_arm_rsr64("MPIDR_EL1") & 0xffffff, __builtin_arm_rsr64("SCTLR_EL1"), (t1 - t0) * 1000000 / f,
 +	    t1 == t0 ? 0 : 10000000ULL * f / (t1 - t0) / 1000000, (t2 - t1) * 1000000 / f);
@@ -1988,7 +2001,7 @@ index e26a1d70f470..722c74face07 100644
  #ifdef XNU_ENABLE_PROCESSOR_EXIT
  SECURITY_READ_ONLY_LATE(bool) enable_processor_exit = true;
  #else
-@@ -335,7 +427,11 @@ arm_setup_pre_sign(void)
+@@ -335,7 +438,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -2000,7 +2013,7 @@ index e26a1d70f470..722c74face07 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +450,7 @@ arm_init(
+@@ -354,6 +461,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -2008,7 +2021,7 @@ index e26a1d70f470..722c74face07 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +459,19 @@ arm_init(
+@@ -362,14 +470,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -2028,7 +2041,7 @@ index e26a1d70f470..722c74face07 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +487,7 @@ arm_init(
+@@ -385,6 +498,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -2036,7 +2049,7 @@ index e26a1d70f470..722c74face07 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +525,13 @@ arm_init(
+@@ -422,10 +536,13 @@ arm_init(
  	}
  #endif
  
@@ -2050,7 +2063,7 @@ index e26a1d70f470..722c74face07 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +545,14 @@ arm_init(
+@@ -439,11 +556,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -2065,7 +2078,7 @@ index e26a1d70f470..722c74face07 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +561,16 @@ arm_init(
+@@ -452,12 +572,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -2082,7 +2095,7 @@ index e26a1d70f470..722c74face07 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +578,7 @@ arm_init(
+@@ -465,6 +589,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -2090,7 +2103,7 @@ index e26a1d70f470..722c74face07 100644
  
  	processor_bootstrap();
  
-@@ -510,10 +624,20 @@ arm_init(
+@@ -510,10 +635,20 @@ arm_init(
  	PE_parse_boot_argn("immediate_NMI", &force_immediate_debug_halt, sizeof(force_immediate_debug_halt));
  
  #if __ARM_PAN_AVAILABLE__
@@ -2112,7 +2125,7 @@ index e26a1d70f470..722c74face07 100644
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +651,9 @@ arm_init(
+@@ -527,7 +662,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2122,7 +2135,7 @@ index e26a1d70f470..722c74face07 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +695,7 @@ arm_init(
+@@ -569,6 +706,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2130,7 +2143,7 @@ index e26a1d70f470..722c74face07 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +774,10 @@ arm_init(
+@@ -647,6 +785,10 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2141,7 +2154,7 @@ index e26a1d70f470..722c74face07 100644
  	machine_startup(args);
  }
  
-@@ -661,7 +792,9 @@ arm_init_cpu(
+@@ -661,7 +803,9 @@ arm_init_cpu(
  	cpu_data_t      *cpu_data_ptr)
  {
  #if __ARM_PAN_AVAILABLE__
@@ -2152,7 +2165,7 @@ index e26a1d70f470..722c74face07 100644
  #endif
  
  #ifdef __arm64__
-@@ -673,6 +806,9 @@ arm_init_cpu(
+@@ -673,6 +817,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2162,7 +2175,7 @@ index e26a1d70f470..722c74face07 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
-@@ -756,6 +892,9 @@ arm_init_cpu(
+@@ -756,6 +903,9 @@ arm_init_cpu(
  	if (should_kprintf) {
  		kprintf("arm_cpu_init(): cpu %d online\n", cpu_data_ptr->cpu_number);
  	}
@@ -2172,7 +2185,7 @@ index e26a1d70f470..722c74face07 100644
  
  	if (cpu_data_ptr == &BootCpuData) {
  		if (kdebug_enable == 0) {
-@@ -793,7 +932,9 @@ arm_init_idle_cpu(
+@@ -793,7 +943,9 @@ arm_init_idle_cpu(
  	cpu_data_t      *cpu_data_ptr)
  {
  #if __ARM_PAN_AVAILABLE__
