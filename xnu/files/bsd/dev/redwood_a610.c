@@ -40,7 +40,10 @@
  *   9  asks    TrustZone to check the zap shader's signature: its header (fw/a610_zap.mdt of the
  *              small image, the phone's own /vendor/firmware/a610_zap.mdt: the ELF header and the
  *              block of hashes and certificates) goes into a page of ours, which TrustZone reads
- *              (the first of the three calls of Linux's qcom_mdt_pas_init; nothing of the GPU)
+ *              (PAS_INIT_IMAGE); then, as the rest of Linux's qcom_mdt_load, its code into the
+ *              device tree's gpu_region (PAS_MEM_SETUP first) and PAS_AUTH_AND_RESET (zap_load).
+ *              Only with a610_zap=1. The call came back "interrupted" for ever until the timer's
+ *              interrupt was the right one (19, not 27: gic_v3_irq.c); since then it takes 3 resumptions
  *  10  writes  memory of ours for the 3D core, physically in one piece: its ring of commands, its
  *              microcode (fw/a630_sqe.fw, the phone's own, less the file's first word) and a page
  *              to be written on command. The core is given physical addresses
@@ -51,7 +54,9 @@
  *              device tree's kgsl-smmu has "qcom,skip-init", it is Linux that programs the GPU's
  *              streams (gfx3d_user: SID 0 mask 1, gfx3d_secure: SID 2). One match for SIDs 0-3 goes
  *              to context 4 with its translation off, as arm-smmu-qcom.c's bypass_quirk does: a
- *              plain bypass S2CR is turned into "fault" by Qualcomm's hypervisor
+ *              plain bypass S2CR is turned into "fault" by Qualcomm's hypervisor. With the zap
+ *              shader in (step 9), CP_SET_SECURE_MODE 0 after "initialize", as a6xx_hw_init does:
+ *              RBBM_SECVID_TRUST_CNTL goes from 1 to 0, the core is out of secure mode
  *  12  commands the core to write a word into our page, first as it is (in secure mode: TRUST_CNTL
  *              reads 1), and if that does not land, after CP_SET_SECURE_MODE 0 -- the packet Linux
  *              sends once the zap shader is in. Writing RBBM_SECVID_TRUST_CNTL = 0 from here, as
@@ -62,8 +67,10 @@
  *              the panel: only with a610_smmu=1, which (in step 11, instead of a610_bypass=1) gives
  *              the core addresses of its own through page tables of ours in the SMMU's context 0
  *
- * Steps 9 to 12 go one after the other whatever 9 says: TrustZone does not take the zap shader's
- * signature here (it answers "not supported", SMCCC's -1), and 12 is the way round it, if there is one.
+ * Steps 9 to 12 go one after the other whatever 9 says. Without the zap shader the core stays in
+ * secure mode: CP_MEM_WRITE lands, but what the 2D engine draws (step 13) goes nowhere of ours --
+ * in secure mode its colour units write as the secure stream. With it (a610_zap=1, 2026-10-25)
+ * step 13 draws: its three bands are on the panel.
  *
  * Register layouts: Xiaomi's ginkgo-q-oss kernel, drivers/clk/qcom/gpucc-trinket.c and
  * gcc-trinket.c, drivers/gpu/msm/adreno_a6xx.c; the phone's own device tree (qcom,kgsl-3d0@5900000,
@@ -709,16 +716,55 @@ smmu_faults(const char *when)
 static int32_t
 scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t *answer);
 
+static uint32_t scm_before_counts[1024];
+
+/* which interrupts this kernel took while the call went on (gic_v3_irq.c counts them all) */
+static void
+scm_interrupts(void)
+{
+	extern uint32_t gic_intid_counts[1024];
+	uint32_t shown = 0;
+
+	for (uint32_t n = 0; n < 1024; n++) {
+		uint32_t more = gic_intid_counts[n] - scm_before_counts[n];
+
+		if (more != 0 && shown++ < 12) {
+			printf("a610: ... meanwhile interrupt %u came %u times\n", n, more);
+		}
+	}
+	if (shown == 0) {
+		printf("a610: ... meanwhile this kernel took NO interrupt at all\n");
+	}
+}
+
+static int32_t
+scm3(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t *answer);
+
 static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t *answer)
 {
-	return scm2(what, function, arguments, first, 0, answer);
+	return scm3(what, function, arguments, first, 0, 0, answer);
 }
 
 static int32_t
 scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t *answer)
 {
+	return scm3(what, function, arguments, first, second, 0, answer);
+}
+
+static int32_t
+scm3(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t *answer)
+{
+	/*
+	 * Resumed as mainline's qcom_scm-smc.c does it: the call's own x1-x5, x6 the session TrustZone
+	 * gave back (ARM_SMCCC_QUIRK_QCOM_A6).
+	 */
 	uint64_t session = 0;
+	extern uint32_t gic_intid_counts[1024];
+
+	memcpy(scm_before_counts, gic_intid_counts, sizeof(scm_before_counts));
 
 	printf("a610: about to ask TrustZone %s: smc %#llx (%#llx)\n", what, function, first);
 	uint64_t deadline;
@@ -728,8 +774,9 @@ scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
 	 * an interrupt is due, and is resumed so: as often as it takes, up to 20 s of it.
 	 */
 	/*
-	 * Should it go on saying "interrupted": an interrupt pending for this side that is never taken
-	 * would do that. The first few times and the last say how soon it came back and what this
+	 * Should it go on saying "interrupted": an interrupt pending for this side that keeps coming
+	 * would do that -- on willow it was PPI 27, taken for the timer and asserted for ever (see
+	 * gic_v3_irq.c's gic_vtimer); the interrupts taken meanwhile are said at the end. The first few times and the last say how soon it came back and what this
 	 * processor has pending (ICC_HPPIR1_EL1: the highest group 1 interrupt; ISR_EL1; DAIF).
 	 */
 	uint64_t started = mach_absolute_time(), before = started, i = 0;
@@ -749,7 +796,7 @@ scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
 		register uint64_t x1 __asm__("x1") = arguments;
 		register uint64_t x2 __asm__("x2") = first;
 		register uint64_t x3 __asm__("x3") = second;
-		register uint64_t x4 __asm__("x4") = 0;
+		register uint64_t x4 __asm__("x4") = third;
 		register uint64_t x5 __asm__("x5") = 0;
 		register uint64_t x6 __asm__("x6") = session;
 		register uint64_t x7 __asm__("x7") = 0;
@@ -759,14 +806,122 @@ scm2(const char *what, uint64_t function, uint64_t arguments, uint64_t first, ui
 		session = x6;
 		if (x0 != SCM_INTERRUPTED) {
 			printf("a610: TrustZone returns %d, answer %#llx (after %llu resumptions)\n", (int32_t)x0, x1, i);
+			if (i > 0) {
+				scm_interrupts();
+			}
 			*answer = x1;
 			return (int32_t)x0;
+		}
+		if (i < 4) {
+			printf("a610: ... TrustZone gave back x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx x6 %#llx\n", x1, x2, x3,
+			    x4, x5, x6);
 		}
 	}
 	printf("a610: TrustZone still says the call was interrupted after 20 s (%llu times; pending %#llx, ISR %#llx)\n", i,
 	    __builtin_arm_rsr64("S3_0_C12_C12_2"), __builtin_arm_rsr64("S3_0_C12_C1_0"));
+	scm_interrupts();
 	(void)started;
 	return -1;
+}
+
+/*
+ * The rest of Linux's qcom_mdt_load for the zap shader, once TrustZone has taken its signature
+ * (PAS_INIT_IMAGE). Its one loadable segment is relocatable (QCOM_MDT_RELOCATABLE, bit 27 of its
+ * flags), so it goes where the device tree's pil_gpu_mem has room for it: gpu_region, 8 KB at
+ * 0x57515000 ("no-map"; UEFI's map has it reserved). TrustZone is told where and how much first
+ * (PAS_MEM_SETUP), the segments are copied there from their files (.b00 to .b02 of the small
+ * image, zeros past what a file has up to the segment's memory size), and then TrustZone
+ * authenticates and starts it (PAS_AUTH_AND_RESET). After that CP_SET_SECURE_MODE 0 takes the
+ * core out of secure mode, as a6xx_hw_init has it (step 11).
+ */
+#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
+#define SCM_THREE_VALUES        3
+#define ZAP_REGION_PHYS         0x57515000UL
+#define ZAP_REGION_SIZE         0x2000UL
+#define MDT_RELOCATABLE         (1u << 27)
+#define MDT_TYPE(flags)         (((flags) >> 24) & 7)
+#define MDT_TYPE_HASH           2
+
+static bool zap_loaded;
+
+static uint32_t
+le32(const uint8_t *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void
+zap_load(const uint8_t *header, uint32_t segments)
+{
+	uint32_t low = ~0u, high = 0;
+	bool relocatable = false;
+	uint64_t answer = ~0ull;
+	vm_offset_t region;
+
+	for (uint32_t i = 0; i < segments; i++) {
+		const uint8_t *ph = header + 52 + 32 * i;
+		uint32_t paddr = le32(ph + 12), memsz = le32(ph + 20), flags = le32(ph + 24);
+
+		if (le32(ph) != 1 || memsz == 0 || MDT_TYPE(flags) == MDT_TYPE_HASH) {
+			continue;
+		}
+		relocatable |= (flags & MDT_RELOCATABLE) != 0;
+		low = paddr < low ? paddr : low;
+		high = paddr + memsz > high ? paddr + memsz : high;
+	}
+	high = (high + 0xfff) & ~0xfffu;
+	printf("a610: the zap shader's segments: %#x to %#x, %s\n", low, high, relocatable ? "relocatable" : "NOT relocatable");
+	if (low >= high || !relocatable || high - low > ZAP_REGION_SIZE) {
+		printf("a610: not a zap shader that fits gpu_region (%#lx bytes at %#lx)\n", ZAP_REGION_SIZE, ZAP_REGION_PHYS);
+		redwood_status(REDWOOD_STATUS_GPU, "FAILED 9: zap does not fit its region");
+		return;
+	}
+	if (scm3("where the zap shader is to go", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_REGION_PHYS,
+	    high - low, &answer) != 0 || answer != 0) {
+		redwood_status(REDWOOD_STATUS_GPU, "FAILED 9: TZ refuses the zap region (%#llx)", answer);
+		return;
+	}
+	region = ml_io_map(ZAP_REGION_PHYS, ZAP_REGION_SIZE);
+	for (uint32_t i = 0; i < segments; i++) {
+		const uint8_t *ph = header + 52 + 32 * i;
+		uint32_t paddr = le32(ph + 12), filesz = le32(ph + 16), memsz = le32(ph + 20), flags = le32(ph + 24);
+		vm_offset_t to = region + (paddr - low);
+		char name[24];
+		uint64_t size = 0;
+		const uint8_t *data;
+
+		if (le32(ph) != 1 || memsz == 0 || MDT_TYPE(flags) == MDT_TYPE_HASH) {
+			continue;
+		}
+		snprintf(name, sizeof(name), "a610_zap.b%02u", i);
+		data = redwood_image_file("fw", name, &size, NULL);
+		if (data == NULL || size < filesz) {
+			printf("a610: no fw/%s of %u bytes in the small image\n", name, filesz);
+			redwood_status(REDWOOD_STATUS_GPU, "FAILED 9: no %s", name);
+			return;
+		}
+		for (uint32_t at = 0; at < memsz; at += 4) {
+			uint32_t word = 0;
+
+			for (uint32_t b = 0; b < 4; b++) {
+				word |= at + b < filesz ? (uint32_t)data[at + b] << (8 * b) : 0;
+			}
+			*(volatile uint32_t *)(to + at) = word;
+		}
+		__builtin_arm_dsb(0xf);
+		printf("a610: segment %u (%s, %u bytes, %u in memory) at %#lx: its first words read back %#x %#x\n", i, name,
+		    filesz, memsz, ZAP_REGION_PHYS + (paddr - low), rd(to), rd(to + 4));
+	}
+	answer = ~0ull;
+	if (scm("to authenticate and start the zap shader", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_GPU,
+	    &answer) != 0 || answer != 0) {
+		printf("a610: TrustZone does not start the zap shader (answer %#llx)\n", answer);
+		redwood_status(REDWOOD_STATUS_GPU, "FAILED 9: TZ does not start zap (%#llx)", answer);
+		return;
+	}
+	zap_loaded = true;
+	printf("a610: THE ZAP SHADER IS IN: TrustZone has authenticated and started it\n");
+	redwood_status(REDWOOD_STATUS_GPU, "zap shader IN");
 }
 
 extern volatile int redwood_rpm_done;
@@ -1030,6 +1185,12 @@ a610_thread(void *parameter, __unused wait_result_t result)
 			goto step10;
 		}
 	}
+	{
+		/* the timer as every processor has taken it so far: TrustZone stops for what this side has pending */
+		extern void gic_v3_timer_report(int (*out)(const char *, ...));
+
+		gic_v3_timer_report(say);
+	}
 	redwood_status(REDWOOD_STATUS_GPU, "step 9: zap shader signature");
 	{
 		uint64_t size = 0, answer = ~0ull;
@@ -1076,6 +1237,7 @@ a610_thread(void *parameter, __unused wait_result_t result)
 		if (result == 0 && answer == 0) {
 			printf("a610: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE\n");
 			redwood_status(REDWOOD_STATUS_GPU, "on; TrustZone ACCEPTS the zap shader's signature");
+			zap_load(header, segments);
 		} else {
 			printf("a610: TrustZone does not take it: the call returns %d, its answer %#llx\n", result, answer);
 			redwood_status(REDWOOD_STATUS_GPU, "FAILED 9: TZ refuses zap: %d, %#llx", result, answer);
@@ -1246,6 +1408,19 @@ step10:
 		printf("a610: THE 3D CORE TAKES COMMANDS\n");
 		redwood_status(REDWOOD_STATUS_GPU, "command processor RUNS");
 		core_speed_measured();
+		if (zap_loaded) {
+			/* a6xx_hw_init, with the zap shader in: out of secure mode by packet */
+			printf("a610: RBBM_SECVID_TRUST_CNTL is %#x before CP_SET_SECURE_MODE 0\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
+			ring_command(CP_SET_SECURE_MODE, 1);
+			ring(0);
+			if (!ring_run("leave secure mode, the zap shader in (CP_SET_SECURE_MODE 0)")) {
+				smmu_faults("after CP_SET_SECURE_MODE");
+				redwood_status(REDWOOD_STATUS_GPU, "FAILED 11: CP_SET_SECURE_MODE 0 does not go through");
+				goto out;
+			}
+			printf("a610: RBBM_SECVID_TRUST_CNTL is %#x after it%s\n", rd(gpu + RBBM_SECVID_TRUST_CNTL),
+			    rd(gpu + RBBM_SECVID_TRUST_CNTL) == 0 ? ": THE 3D CORE IS OUT OF SECURE MODE" : "");
+		}
 	}
 	if (steps < 12) {
 		goto out;
@@ -1259,7 +1434,7 @@ step10:
 		static const uint32_t words[] = { 0x600dc0de, 0x600dc0d1 };
 		bool wrote = false;
 
-		printf("a610: RBBM_SECVID_TRUST_CNTL is %#x (not written: that hangs the bus here)\n",
+		printf("a610: RBBM_SECVID_TRUST_CNTL is %#x (never written: that hangs the bus here)\n",
 		    rd(gpu + RBBM_SECVID_TRUST_CNTL));
 		for (unsigned i = 0; i < 2 && !wrote; i++) {
 			if (i == 1) {
@@ -1278,7 +1453,7 @@ step10:
 			ring((uint32_t)target);
 			ring((uint32_t)(target >> 32));
 			ring(words[i]);
-			if (!ring_run(i == 0 ? "write a word to memory, in secure mode" : "write a word to memory, out of it")) {
+			if (!ring_run(i == 0 && !zap_loaded ? "write a word to memory, in secure mode" : "write a word to memory, out of it")) {
 				smmu_faults("after the write");
 				redwood_status(REDWOOD_STATUS_GPU, "FAILED 12: write %u does not go through", i + 1);
 				goto out;
@@ -1368,7 +1543,7 @@ step10:
 			ring(0);
 			ring(0x0d0e0d0e + attempt);
 			ring_command(CP_WAIT_FOR_IDLE, 0);
-			if (!ring_run(attempt == 0 ? "fill a picture, in secure mode" : "fill a picture, out of secure mode")) {
+			if (!ring_run(attempt == 0 && !zap_loaded ? "fill a picture, in secure mode" : "fill a picture, out of secure mode")) {
 				space_faulted("filling the picture");
 				redwood_status(REDWOOD_STATUS_GPU, "FAILED 13: the fill does not go through");
 				goto out;
@@ -1386,7 +1561,8 @@ step10:
 			    pixel[2339 * PICTURE_ROW + 4318], pixel[2339 * PICTURE_ROW + 4319]);
 			drawn = (pixel[0] | pixel[1] | pixel[2]) != 0 && pixel[1170 * PICTURE_ROW + 2160] != 0 &&
 			    (pixel[2339 * PICTURE_ROW + 4316] | pixel[2339 * PICTURE_ROW + 4317] | pixel[2339 * PICTURE_ROW + 4318]) != 0;
-			printf("a610: attempt %u (%s): %s\n", attempt + 1, attempt == 0 ? "secure mode" : "after CP_SET_SECURE_MODE 0",
+			printf("a610: attempt %u (%s): %s\n", attempt + 1, zap_loaded ? "out of secure mode, the zap shader in" :
+			    attempt == 0 ? "secure mode" : "after CP_SET_SECURE_MODE 0",
 			    drawn ? "DRAWN" : "the picture is not what the 3D core was told to draw");
 		}
 		if (!drawn) {

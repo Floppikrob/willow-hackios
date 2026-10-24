@@ -72,7 +72,8 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+#define GIC_INTID_VTIMER_SBSA   27          /* EL1 virtual timer PPI, as SBSA numbers it (QEMU, redwood) */
+#define GIC_INTID_VTIMER_QCOM   19          /* ... as Qualcomm's arch timer has it: PPIs 1, 2, 3, 0 */
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_SPI_MOST            48          /* attached at a time */
@@ -81,6 +82,16 @@
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
+/*
+ * The EL1 virtual timer's interrupt. SBSA has it at 27; the willow's device tree has the arch
+ * timer at <1 1>, <1 2>, <1 3>, <1 0>: secure physical 17, physical 18, virtual 19, hypervisor 16.
+ * Taken at 27 there, the timer came only by accident: 27 is a line that stays asserted on its
+ * own (pending in every redistributor with the timer not firing, ISTATUS 0), and its 1.2 million
+ * interrupts a second on each core went through rtclock_intr() like the timer's, so the timers
+ * were looked at all the time. It also had TrustZone stop every ~90 us of a long call, "interrupted".
+ * device=willow (xnuloader's), or vtimer_ppi=N: 19 there, and 27 switched off.
+ */
+static uint32_t    gic_vtimer = GIC_INTID_VTIMER_SBSA;
 
 /*
  * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
@@ -93,6 +104,15 @@ static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor fr
 static uint64_t gic_active_iar[MAX_CPUS];
 uint64_t        gic_unhandled_count;
 uint32_t        gic_last_unhandled;
+/* every interrupt taken, by number (redwood_a610.c: who keeps interrupting TrustZone) */
+uint32_t        gic_intid_counts[1024];
+/*
+ * The virtual timer, per processor (willow takes 1.75 million of them a second): how many, how
+ * many before the deadline the kernel had set (rtcPop), and the timer as the handler leaves it.
+ */
+uint64_t        gic_timer_counts[8], gic_timer_early[8], gic_timer_no_status[8];
+uint64_t        gic_timer_ctl[8];
+int64_t         gic_timer_tval[8], gic_timer_ahead[8];
 
 /*
  * The attached SPIs. A slot is filled before its interrupt is enabled and emptied after it has
@@ -284,6 +304,34 @@ gic_v3_spi_detach(uint32_t intid)
 	}
 }
 
+/*
+ * The virtual timer of every processor that has one: what its handler counted, and its PPI as
+ * that processor's redistributor has it (edge or level, pending, active), for redwood_a610.c.
+ */
+void gic_v3_timer_report(int (*out)(const char *, ...));
+void
+gic_v3_timer_report(int (*out)(const char *, ...))
+{
+	for (int c = 0; c < MAX_CPUS && c < 8; c++) {
+		vm_offset_t gicr = gicr_cpu_base[c];
+
+		if (gicr == 0) {
+			continue;
+		}
+		out("gic: cpu %d's timer: %llu interrupts, %llu before their deadline, %llu with the timer not firing "
+		    "(ISTATUS 0); interrupt %u %s, pending %u, active %u, enabled %u; after the last: control %#llx, TVAL %lld\n", c,
+		    gic_timer_counts[c], gic_timer_early[c], gic_timer_no_status[c], gic_vtimer,
+		    (gic_read32(gicr + GICR_SGI_BASE + 0x0c00 + 4 * (gic_vtimer / 16)) >> (2 * (gic_vtimer % 16))) & 2 ?
+		    "edge" : "level",
+		    (gic_read32(gicr + GICR_SGI_BASE + 0x0200) >> gic_vtimer) & 1,
+		    (gic_read32(gicr + GICR_SGI_BASE + 0x0300) >> gic_vtimer) & 1,
+		    (gic_read32(gicr + GICR_ISENABLER0) >> gic_vtimer) & 1, gic_timer_ctl[c], gic_timer_tval[c]);
+	}
+	out("gic: this processor (%d): ICC_CTLR_EL1 %#llx, PMR %#llx, CNTV_CTL %#llx, CNTKCTL %#llx\n", cpu_number(),
+	    __builtin_arm_rsr64("ICC_CTLR_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("CNTV_CTL_EL0"),
+	    __builtin_arm_rsr64("CNTKCTL_EL1"));
+}
+
 /* How many have arrived since it was attached. */
 uint64_t
 gic_v3_spi_count(uint32_t intid)
@@ -309,11 +357,25 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			break;
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
+		gic_intid_counts[intid]++;
 
-		if (intid == GIC_INTID_VTIMER) {
+		if (intid == gic_vtimer) {
+			cpu_data_t *cdp = getCpuDatap();
+			int slot = cpu & 7;
+
+			gic_timer_counts[slot]++;
+			if (mach_absolute_time() < cdp->rtcPop) {
+				gic_timer_early[slot]++;
+			}
+			if (!(__builtin_arm_rsr64("CNTV_CTL_EL0") & CNTV_CTL_EL0_ISTATUS)) {
+				gic_timer_no_status[slot]++;
+			}
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
+			gic_timer_ctl[slot] = __builtin_arm_rsr64("CNTV_CTL_EL0");
+			gic_timer_tval[slot] = (int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0");
+			gic_timer_ahead[slot] = (int64_t)(cdp->rtcPop - mach_absolute_time());
 		} else if (intid == GIC_SGI_SIGNAL) {
 			cpu_signal_handler();
 		} else if (intid == GIC_SGI_STOP) {
@@ -418,7 +480,7 @@ gic_v3_irq_cpu_init(void)
 {
 	int cpu = cpu_number();
 	vm_offset_t gicr;
-	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint32_t mine;
 
 	if (gicd_base == 0) {
 		DTEntry entry;
@@ -434,6 +496,17 @@ gic_v3_irq_cpu_init(void)
 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
 		simple_lock_init(&gic_spi_lock, 0);
+		{
+			char device[16] = "";
+			uint32_t ppi = 0;
+
+			if (PE_parse_boot_arg_str("device", device, sizeof(device)) && strcmp(device, "willow") == 0) {
+				gic_vtimer = GIC_INTID_VTIMER_QCOM;
+			}
+			if (PE_parse_boot_argn("vtimer_ppi", &ppi, sizeof(ppi)) && ppi >= 16 && ppi < 32) {
+				gic_vtimer = ppi;
+			}
+		}
 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
 		gicr_size = reg[3];
@@ -449,6 +522,11 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_isb(ISB_SY);
 
 	gicr = gicr_cpu_base[cpu] = gic_find_redistributor();
+	mine = 1u << gic_vtimer;
+	if (gic_vtimer != GIC_INTID_VTIMER_SBSA) {
+		/* not the timer here (see gic_vtimer), and asserted for ever: off, whoever left it on */
+		gic_write32(gicr + GICR_ICENABLER0, 1u << GIC_INTID_VTIMER_SBSA);
+	}
 
 	uint32_t waker = gic_read32(gicr + GICR_WAKER);
 	if (waker & (GICR_WAKER_PROCSLEEP | GICR_WAKER_CHILDASLEEP)) {
@@ -476,7 +554,7 @@ gic_v3_irq_cpu_init(void)
 	/* Virtual timer PPI (and those): Group 1 (IRQ), default priority, enabled */
 	gic_write32(gicr + GICR_IGROUPR0, gic_read32(gicr + GICR_IGROUPR0) | mine);
 	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
-	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(gic_vtimer)) = GIC_PRIORITY_DEFAULT;
 	gic_write32(gicr + GICR_ISENABLER0, mine);
 
 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
@@ -501,8 +579,8 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_isb(ISB_SY);
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
-	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on interrupt %u\n",
+	    (void *)gicd_base, cpu, (void *)gicr, gic_vtimer);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */
