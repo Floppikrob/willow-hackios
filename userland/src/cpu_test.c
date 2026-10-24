@@ -70,7 +70,7 @@ work(void *arg)
 int
 main(int argc, char **argv)
 {
-	int active = number("hw.activecpu"), threads = active < 2 ? 2 : active > MOST ? MOST : active;
+	int active, threads;
 	int where[MOST], seen = 0;
 	pthread_t thread[MOST];
 	uint64_t start, alone, together, spent;
@@ -78,6 +78,9 @@ main(int argc, char **argv)
 	if (argc > 1) {
 		sleep((unsigned)atoi(argv[1]));
 	}
+	/* counted after the wait: on willow the slower cores come up some 25 s into the boot, while it sleeps */
+	active = number("hw.activecpu");
+	threads = active < 2 ? 2 : active > MOST ? MOST : active;
 	printf("cpu_test: hw.ncpu %d, hw.activecpu %d, hw.physicalcpu %d, hw.logicalcpu %d\n", number("hw.ncpu"),
 	    number("hw.activecpu"), number("hw.physicalcpu"), number("hw.logicalcpu"));
 	if (argc < 2) {
