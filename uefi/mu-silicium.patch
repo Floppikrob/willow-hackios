@@ -1,8 +1,31 @@
 diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
-index 4d20855..3c3b17b 100644
+index 4d208553..3de3972b 100644
 --- a/BootShim/BootShim.S
 +++ b/BootShim/BootShim.S
-@@ -28,6 +28,27 @@ _CopyLoop:
+@@ -3,12 +3,22 @@ _Head:
+   b     _Start          /* Jump to the real code */
+ 
+ #if REQUIRES_KERNEL_HEADER == 1
++#ifdef TEXT_OFFSET
++  /*
++   * The header of a stock Linux Image (willow's ABL hangs on text_offset = FD_BASE): loaded
++   * anywhere in RAM, the shim copies the FD to FD_BASE as usual
++   */
++  .quad TEXT_OFFSET     /* Text Offset */
++  .quad IMAGE_SIZE      /* Image Size: the shim, the FD and the payload (mkxnuimg.py) */
++  .quad 0xA             /* Flags: little-endian, 4K pages, anywhere in RAM */
++#else
+ _StackBase:
+   .quad FD_BASE         /* Text Offset */
+ 
+ _StackSize:
+   .quad FD_SIZE         /* Image Size */
+   .quad 0               /* Flags */
++#endif
+   .quad 0               /* Reserved */
+   .quad 0               /* Reserved */
+   .quad 0               /* Reserved */
+@@ -28,6 +38,27 @@ _CopyLoop:
    stp   x2, x3, [x5], #16
    subs  x6, x6, #16
    b.ne  _CopyLoop
@@ -30,8 +53,29 @@ index 4d20855..3c3b17b 100644
    ldr   x5, =FD_BASE
  
  _Entry:
+diff --git a/Platforms/Xiaomi/willowPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/Xiaomi/willowPkg/Library/MemoryMapLib/MemoryMapLib.c
+index 5c6d974b..533dd586 100644
+--- a/Platforms/Xiaomi/willowPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/Xiaomi/willowPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -9,6 +9,8 @@ gMemoryDescriptor[] = {
+   {"HYP",               0x45700000, 0x00600000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+   {"AOP CMD DB",        0x45F20000, 0x00020000, AddMem, MEM_RES, WRITE_COMBINEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+   {"SMEM",              0x46000000, 0x00200000, AddMem, MEM_RES, WRITE_COMBINEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"QTEE",              0x46200000, 0x00B00000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"TZApps",            0x46D00000, 0x02200000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+   {"PIL Reserved",      0x4AB00000, 0x0D200000, AddMem, MEM_RES, WRITE_COMBINEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+   {"DXE Heap",          0x57D00000, 0x03400000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
+   {"DBI Dump",          0x5B100000, 0x00A00000, NoHob,  MMAP_IO, INITIALIZED, Conv,   UNCACHED_UNBUFFERED_XN},
+@@ -21,6 +23,7 @@ gMemoryDescriptor[] = {
+   {"UEFI Stack",        0x5FF90000, 0x00040000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
+   {"Log Buffer",        0x5FFF7000, 0x00008000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
+   {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
++  {"XNU Payload",       0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+ 
+   // Other Memory Regions
+   {"AOP_SS_MSG_RAM",    0x045F0000, 0x00007000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
 diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
-index 9b18ddb..f5bff32 100644
+index 9b18ddb1..f5bff326 100644
 --- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
 +++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c
 @@ -1,241 +1,245 @@
@@ -522,7 +566,7 @@ index 9b18ddb..f5bff32 100644
 +  DeviceBootManagerBdsEntry ();
 +}
 diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
-index 2310dc6..12a5a5d 100644
+index 2310dc61..12a5a5dc 100644
 --- a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
 +++ b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManagerLib.inf
 @@ -1,50 +1,55 @@

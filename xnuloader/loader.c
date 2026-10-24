@@ -522,6 +522,7 @@ struct platform {
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
+	const uint32_t *core_mpidr;      /* or, when they are in clusters (Aff1 the cluster, Aff0 the core): the MPIDR of each */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
@@ -554,12 +555,53 @@ static const struct platform platform_redwood = {
 };
 
 /*
+ * Redmi Note 8T (willow, SM6125): two clusters, not DynamIQ -- cpu@0..3 are the Kryo 260 Silver cores
+ * (Cortex-A53 class), cpu@100..103 the Gold ones (Cortex-A73 class). The firmware's PSCI is called with SMC.
+ */
+static const uint32_t willow_core_mpidr[8] = { 0x000, 0x001, 0x002, 0x003, 0x100, 0x101, 0x102, 0x103 };
+
+static const struct platform platform_willow = {
+	.name = "willow", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x0F200000, .gic_redist = 0x0F300000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_mpidr = willow_core_mpidr,
+	/*
+	 * The slower cores, for the scheduler: here the Gold cluster. The firmware brings it up through
+	 * PSCI at its lowest clock (~150 MHz by cpuprobe=1, against ~650 MHz for Silver), and nothing in
+	 * this port drives the OSM that would raise it yet; until something does, Silver is the fast one.
+	 */
+	.small_cores = 0xf0,
+	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
+};
+
+/* The MPIDR of core N, and the other way round (-1: not one of the platform's cores). */
+static uint64_t
+platform_core_mpidr(const struct platform *plat, int core)
+{
+	return plat->core_mpidr ? plat->core_mpidr[core] : (uint64_t)core << plat->core_shift;
+}
+
+static int
+platform_mpidr_core(const struct platform *plat, uint64_t mpidr)
+{
+	if (plat->core_mpidr == NULL) {
+		return (int)(mpidr >> plat->core_shift);
+	}
+	for (int core = 0; core < plat->cores; core++) {
+		if (plat->core_mpidr[core] == (mpidr & 0xFFFFFF)) {
+			return core;
+		}
+	}
+	return -1;
+}
+
+/*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_willow,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -651,9 +693,18 @@ __asm__ (
         "  msr daifset, #0xf\n"
         /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
          * UEFI maps its memory as EL0-accessible, so with PAN every data access
-         * (including the exception handler's own stack push) faults. */
+         * (including the exception handler's own stack push) faults. An ARMv8.0
+         * core (Cortex-A53/A73 class) has neither bit: there the msr is undefined. */
+        "  mrs x9, id_aa64mmfr1_el1\n"
+        "  ubfx x9, x9, #20, #4\n"      /* PAN */
+        "  cbz x9, 7f\n"
         "  .inst 0xd500409f\n"          /* msr PAN, #0 */
+        "7:\n"
+        "  mrs x9, id_aa64mmfr2_el1\n"
+        "  ubfx x9, x9, #4, #4\n"       /* UAO */
+        "  cbz x9, 8f\n"
         "  .inst 0xd500407f\n"          /* msr UAO, #0 */
+        "8:\n"
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -824,8 +875,16 @@ __asm__ (
         ".globl other_cpu_return_stub\n"
         "other_cpu_return_stub:\n"              /* x0..x7 as for loader_return_stub */
         "  msr daifset, #0xf\n"
+        "  mrs x9, id_aa64mmfr1_el1\n"          /* PAN and UAO only where the core has them */
+        "  ubfx x9, x9, #20, #4\n"
+        "  cbz x9, 7f\n"
         "  .inst 0xd500409f\n"                  /* msr PAN, #0 */
+        "7:\n"
+        "  mrs x9, id_aa64mmfr2_el1\n"
+        "  ubfx x9, x9, #4, #4\n"
+        "  cbz x9, 8f\n"
         "  .inst 0xd500407f\n"                  /* msr UAO, #0 */
+        "8:\n"
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -862,6 +921,7 @@ static uint64_t smc_x3;
 static const struct platform *PLAT;
 static void clean_dcache(uint64_t start, uint64_t end);
 static void flush_dcache(uint64_t start, uint64_t end);
+static uint64_t win_base, win_size;     /* XNU's physical memory window (defined with choose_window) */
 
 /* What the kernel shows a watching loader (struct loader_live in XNU's loader_return.c). */
 struct kernel_live {
@@ -955,6 +1015,14 @@ static int wdt_armed;
  * for the commands that the host sends meanwhile (usb_poll_command).
  */
 static const struct kernel_live *running_live;
+/*
+ * running_live as the image had it, copied before the kernel runs: its address fields are the kernel's
+ * virtual addresses as linked (add the slide), and the kernel rebases its own pointers when it starts
+ * (arm_slide_rebase_and_sign_image), after which those in the live struct no longer add up. Read from
+ * memory -- where the clusters' caches are not one, as on willow -- they led this loader to 0x107c000000.
+ * Only the heartbeat and `stop` are taken from the live one.
+ */
+static struct kernel_live running_live_seen;
 static uint64_t running_slide;
 static void usb_poll_command(void);
 
@@ -2208,6 +2276,14 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 		print("%d s\n", seconds);
 		return;
 	}
+	/* `live` is the copy taken before the kernel ran (running_live_seen); still, believe no address outside the window */
+	if (live->log + slide < win_base || live->log + slide >= win_base + win_size ||
+	    live->log_len + slide < win_base || live->log_len + slide + 4 > win_base + win_size ||
+	    live->log_head + live->log_ring > win_size) {
+		print("%d s: the kernel's log is not where it was said to be (log %x, length at %x)\n", seconds,
+		    live->log + slide, live->log_len + slide);
+		return;
+	}
 	log = (const char *)(live->log + slide);
 	/* its first words are written with the caches off: look at memory */
 	flush_dcache(live->log_len + slide, live->log_len + slide + 4);
@@ -2265,6 +2341,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 
 	running_live = live;
 	running_slide = slide;
+	if (live != NULL) {
+		running_live_seen = *live;
+	}
 	other_cpu_start.entry = entry;
 	other_cpu_start.boot_args = boot_args_pa;
 	other_cpu_stage = 0;
@@ -2299,7 +2378,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				if (!arrived) {
 					print("%d s: the core has not arrived\n", noted);
 				} else {
-					note_kernel_progress(live, slide, noted);
+					running_live_seen.heartbeat = live != NULL ? live->heartbeat : 0;
+					note_kernel_progress(live != NULL ? &running_live_seen : NULL, slide, noted);
 				}
 				flush_log();
 			}
@@ -2345,11 +2425,13 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
+			/* the kernel's heartbeat, from memory (see note_kernel_progress) */
+			flush_dcache((uint64_t)(uintptr_t)&live->heartbeat, (uint64_t)(uintptr_t)&live->heartbeat + sizeof(live->heartbeat));
 			if (live->heartbeat != last_beat) {
 				last_beat = live->heartbeat;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
 			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
-				log_of_hung_kernel(live, slide);
+				log_of_hung_kernel(&running_live_seen, slide);
 				status = OTHER_CPU_HUNG;
 			}
 		}
@@ -2502,6 +2584,8 @@ struct payload_info {
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	const uint8_t *resident;        /* ... or the payload carries it ("resident"), for a phone without our USB link */
+	uint32_t resident_size;
 	int usb_mode;
 };
 
@@ -2551,6 +2635,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->forced_base = parse_number(text, 16); /* testing aid; must be free RAM */
 		} else if (str_eq(e->name, "rdres")) {
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
+		} else if (str_eq(e->name, "resident")) {
+			pi->resident = p + sizeof(*e);            /* copied to the resident address, as `xl ramdisk` puts it */
+			pi->resident_size = e->size;
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
@@ -2795,6 +2882,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
 	}
+	/*
+	 * A resident image in the payload: where `oem ramdisk` would have put it (willow's UEFI has no USB
+	 * device mode, so its small flash-boot image comes this way). Here, in the window, before anything
+	 * of the kernel is: the checks below then see it like one the host downloaded.
+	 */
+	if (pi.resident != NULL) {
+		if (pi.resident_size > win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {
+			print("the payload's resident image (%x bytes) does not fit the window\n", (uint64_t)pi.resident_size);
+			return 0;
+		}
+		memcpy((void *)(phys_base + RESIDENT_RD_OFFSET), pi.resident, pi.resident_size);
+		resident_rd_size = pi.resident_size;
+		print("resident image from the payload: %x bytes\n", (uint64_t)pi.resident_size);
+	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
@@ -2845,6 +2946,57 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("resident image at pa %x size %x: it is the root (md0), the payload ramdisk is md1\n", rd1_pa, rd1_size);
 	}
 
+	/*
+	 * "bench=1": how fast this core is, before the kernel has it -- under UEFI, caches on. The same
+	 * work as userland's cpu_test (sum += i * i into a variable in memory) on a tenth of its rounds,
+	 * and a loop that touches no memory at all: against cpu_test's time under the kernel, it tells a
+	 * slow clock (both slow here too) from memory the kernel maps uncached (only the kernel's slow).
+	 */
+	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "bench=1") && (c == pi.cmdline || c[-1] == ' ')) {
+			volatile uint64_t sum = 0;
+			uint64_t reg = 0, t0 = READ_SYSREG(CNTVCT_EL0), t1, t2, f = READ_SYSREG(CNTFRQ_EL0);
+
+			for (uint64_t i = 0; i < 6000000ULL; i++) {
+				sum += i * i;
+			}
+			t1 = READ_SYSREG(CNTVCT_EL0);
+			for (uint64_t i = 0; i < 60000000ULL; i++) {
+				__asm__ volatile ("add %0, %0, %1" : "+r" (reg) : "r" (i));
+			}
+			t2 = READ_SYSREG(CNTVCT_EL0);
+			print("bench: core %x, sctlr %x: 6M rounds of cpu_test's work %d us (x10: %d ms), 60M register adds %d us (%d MHz if one a cycle)\n",
+			    READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, READ_SYSREG(SCTLR_EL1), (t1 - t0) * 1000000 / f, (t1 - t0) * 10000 / f,
+			    (t2 - t1) * 1000000 / f, (t2 - t1) == 0 ? 0 : 60000000ULL * f / (t2 - t1) / 1000000);
+			/*
+			 * willow: the OSM of each cluster (qcom,clk-cpu-osm-trinket: 0xf521000 Silver, 0xf523000 Gold),
+			 * read only. As Linux's clk-cpu-osm has it: a table of 32-byte rows from 0x110 (frequency word:
+			 * source in bits 31:30 -- 0 for GPLL0 at 300 MHz -- and the PLL's L value in 7:0, times 19.2
+			 * MHz), and the performance state each core asked for from 0x920 on.
+			 */
+			if (PLAT == &platform_willow) {
+				static const uint64_t osm[2] = { 0x0F521000ULL, 0x0F523000ULL };
+
+				for (int c = 0; c < 2; c++) {
+					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[c];
+
+					print("osm %x: enable %x; desired %x %x %x %x\n", osm[c], (uint64_t)r[0],
+					    (uint64_t)r[0x920 / 4], (uint64_t)r[0x924 / 4], (uint64_t)r[0x928 / 4], (uint64_t)r[0x92c / 4]);
+					for (int i = 0; i < 40; i++) {
+						uint32_t fw = r[(0x110 + 32 * i) / 4], vw = r[(0x114 + 32 * i) / 4];
+
+						if (i > 0 && fw == r[(0x110 + 32 * (i - 1)) / 4]) {
+							break;
+						}
+						print("  row %d: freq %x (%d MHz) volt %x\n", (uint64_t)i, (uint64_t)fw,
+						    (fw >> 30) == 0 ? 300 : (uint64_t)(fw & 0xff) * 192 / 10, (uint64_t)vw);
+					}
+				}
+			}
+			break;
+		}
+	}
+
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
@@ -2861,7 +3013,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+			kernel_mpidr = platform_core_mpidr(PLAT, c[8] - '0');
 		}
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
@@ -3179,16 +3331,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
 	 */
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
-	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+	int cpu_count = 1, boot_core = platform_mpidr_core(plat, kernel_mpidr);
 
 	if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
-				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				uint64_t mpidr;
 				int64_t state;
 
-				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
+				if (core < 0 || core >= plat->cores || (mpidr = platform_core_mpidr(plat, core)) == this_mpidr) {
 					continue;
 				}
 				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
@@ -3221,7 +3373,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+		int core = platform_mpidr_core(plat, cpu_mpidr[i]);
+
+		if (core >= 0 && (plat->small_cores & (1u << (core & 31)))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -3273,6 +3427,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	print("jumping to %x\n", entry_va + slide);
 	flush_log();
+	/*
+	 * The screen is the kernel's from here: UEFI's text console scrolls the whole framebuffer at
+	 * every line it adds, and with this loader watching from core 0 (no USB link, as on willow) its
+	 * lines every two seconds dragged the kernel's console and iOS's frames up the panel with them.
+	 * The log still goes to log_buf and the log partition.
+	 */
+	if (SCREEN.base != 0) {
+		screen_quiet = 1;
+	}
 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
 	wdt_set_ms(60000);
 
@@ -3757,7 +3920,7 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem log")) {
 			if (busy) {
-				compose_live_log(running_live, running_slide);
+				compose_live_log(&running_live_seen, running_slide);
 			} else {
 				compose_logs(NULL, 0);
 			}
@@ -3850,6 +4013,11 @@ usb_command_loop(void)
  * VBE_DISPI_MAX_YRES), so the panel is asked for 2048 rows and the kernel scales the
  * 1125x2436 display into it -- the same thing it does on a real phone. */
 #define RAMFB_HEIGHT    2048
+/* Rows padded to 64 bytes: 1125 pixels are 4500 bytes, so most rows would start 4 bytes off a 16-byte
+ * boundary, and the kernel's console clears the screen with 32-byte vector stores (gc_enable), which
+ * take an alignment fault where the framebuffer is mapped as device memory. A phone's panel (1080
+ * pixels: 4320 bytes) never has this. */
+#define RAMFB_STRIDE    ((PHONE_WIDTH * 4 + 63) & ~63)
 #define FW_CFG_BASE     0x09020000ULL   /* QEMU virt: data at +0, selector at +8, DMA address at +16 */
 #define FW_CFG_FILE_DIR 0x19
 #define FW_CFG_DMA_SELECT 0x08
@@ -3886,7 +4054,7 @@ ramfb_phone_screen(void)
 		char name[56];
 	} file;
 	uint32_t count, select = 0;
-	uint64_t fb = 0, bytes = (uint64_t)PHONE_WIDTH * 4 * RAMFB_HEIGHT;
+	uint64_t fb = 0, bytes = (uint64_t)RAMFB_STRIDE * RAMFB_HEIGHT;
 
 	*(volatile uint16_t *)(FW_CFG_BASE + 8) = __builtin_bswap16(FW_CFG_FILE_DIR);
 	fw_cfg_read(&count, sizeof(count));
@@ -3906,7 +4074,7 @@ ramfb_phone_screen(void)
 	cfg.flags = 0;
 	cfg.width = be32(PHONE_WIDTH);
 	cfg.height = be32(RAMFB_HEIGHT);
-	cfg.stride = be32(PHONE_WIDTH * 4);
+	cfg.stride = be32(RAMFB_STRIDE);
 	dma.control = be32(select << 16 | FW_CFG_DMA_SELECT | FW_CFG_DMA_WRITE);
 	dma.length = be32(sizeof(cfg));
 	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
@@ -3921,7 +4089,7 @@ ramfb_phone_screen(void)
 	SCREEN.base = fb;
 	SCREEN.width = PHONE_WIDTH;
 	SCREEN.height = RAMFB_HEIGHT;
-	SCREEN.stride = PHONE_WIDTH * 4;
+	SCREEN.stride = RAMFB_STRIDE;
 }
 
 efi_status EFIAPI

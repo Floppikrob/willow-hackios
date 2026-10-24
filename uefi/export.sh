@@ -6,7 +6,8 @@ set -e
 cd "$(dirname "$(readlink -f "$0")")"
 MU=../Mu-Silicium
 git -C $MU rev-parse HEAD > BASE
-git -C $MU diff -- BootShim Silicon > mu-silicium.patch
+# Platforms/Xiaomi/willowPkg: upstream's willow (Redmi Note 8T) port with the payload region reserved
+git -C $MU diff -- BootShim Silicon Platforms/Xiaomi/willowPkg > mu-silicium.patch
 rm -rf files
 mkdir -p files/Resources/Configs files/Resources/DTBs files/Platforms/Xiaomi files/Binaries \
 	files/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib

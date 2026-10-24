@@ -1878,7 +1878,7 @@ index 0316792a3f42..bbef0a4b26d4 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..cad113dce42c 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -1891,7 +1891,48 @@ index e26a1d70f470..f91095c98d26 100644
  
  #include <console/serial_protos.h>
  
-@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
+@@ -169,6 +172,40 @@ SECURITY_READ_ONLY_LATE(uint64_t) gDramBase;
+ SECURITY_READ_ONLY_LATE(uint64_t) gDramSize;
+ 
+ SECURITY_READ_ONLY_LATE(bool) serial_console_enabled = false;
++
++/* PSTATE.PAN is implemented (misc_protos.h): set by arm_init() before anything touches PAN. */
++SECURITY_READ_ONLY_LATE(bool) arm_pan_present = false;
++
++/*
++ * Boot-arg cpuprobe=1: how fast each processor is as it comes up -- a loop of register adds (its
++ * clock, if one add a cycle) and xnuloader's bench=1 / userland cpu_test's work (sum += i * i into
++ * memory: whether memory is cached). A bring-up aid for SoCs whose cores the boot firmware leaves
++ * slow (willow: cpu_test 50 times slower under the kernel than the same loop under UEFI).
++ */
++static bool cpu_speed_probe_wanted;
++
++static void
++cpu_speed_probe(void)
++{
++	volatile uint64_t sum = 0;
++	uint64_t reg = 0, f = __builtin_arm_rsr64("CNTFRQ_EL0"), t0, t1, t2;
++
++	if (!cpu_speed_probe_wanted || f == 0) {
++		return;
++	}
++	t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++	for (uint64_t i = 0; i < 10000000ULL; i++) {
++		__asm__ volatile ("add %0, %0, %1" : "+r" (reg) : "r" (i));
++	}
++	t1 = __builtin_arm_rsr64("CNTVCT_EL0");
++	for (uint64_t i = 0; i < 1000000ULL; i++) {
++		sum += i * i;
++	}
++	t2 = __builtin_arm_rsr64("CNTVCT_EL0");
++	kprintf("cpuprobe: mpidr %llx sctlr %llx: 10M register adds %llu us (%llu MHz if one a cycle), 1M rounds of cpu_test %llu us\n",
++	    __builtin_arm_rsr64("MPIDR_EL1") & 0xffffff, __builtin_arm_rsr64("SCTLR_EL1"), (t1 - t0) * 1000000 / f,
++	    t1 == t0 ? 0 : 10000000ULL * f / (t1 - t0) / 1000000, (t2 - t1) * 1000000 / f);
++}
+ #ifdef XNU_ENABLE_PROCESSOR_EXIT
+ SECURITY_READ_ONLY_LATE(bool) enable_processor_exit = true;
+ #else
+@@ -335,7 +372,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -1903,7 +1944,7 @@ index e26a1d70f470..f91095c98d26 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +361,7 @@ arm_init(
+@@ -354,6 +395,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -1911,7 +1952,7 @@ index e26a1d70f470..f91095c98d26 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +370,19 @@ arm_init(
+@@ -362,14 +404,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -1931,7 +1972,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +398,7 @@ arm_init(
+@@ -385,6 +432,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -1939,7 +1980,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
+@@ -422,10 +470,13 @@ arm_init(
  	}
  #endif
  
@@ -1953,7 +1994,7 @@ index e26a1d70f470..f91095c98d26 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
+@@ -439,11 +490,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -1968,7 +2009,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
+@@ -452,12 +506,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -1985,7 +2026,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
+@@ -465,6 +523,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -1993,15 +2034,29 @@ index e26a1d70f470..f91095c98d26 100644
  
  	processor_bootstrap();
  
-@@ -514,6 +539,7 @@ arm_init(
+@@ -510,10 +569,20 @@ arm_init(
+ 	PE_parse_boot_argn("immediate_NMI", &force_immediate_debug_halt, sizeof(force_immediate_debug_halt));
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	/* the other cores are the same kind or newer: what the boot core has, they have */
++	arm_pan_present = (__builtin_arm_rsr64("ID_AA64MMFR1_EL1") & ID_AA64MMFR1_EL1_PAN_MASK) != 0;
++	if (arm_pan_present) {
++		__builtin_arm_wsr("pan", 1);
++	}
  #endif  /* __ARM_PAN_AVAILABLE__ */
++	{
++		uint32_t probe = 0;
++
++		cpu_speed_probe_wanted = PE_parse_boot_argn("cpuprobe", &probe, sizeof(probe)) && probe != 0;
++	}
  
  	arm_vm_init(xmaxmem, args);
 +	loader_checkpoint(17);
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
+@@ -527,7 +596,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2011,7 +2066,7 @@ index e26a1d70f470..f91095c98d26 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
+@@ -569,6 +640,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2019,15 +2074,27 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
+@@ -647,6 +719,8 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
 +	loader_checkpoint(21);
++	cpu_speed_probe();          /* the boot processor's (cpuprobe=1) */
  	machine_startup(args);
  }
  
-@@ -673,6 +703,9 @@ arm_init_cpu(
+@@ -661,7 +735,9 @@ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	if (arm_pan_present) {
++		__builtin_arm_wsr("pan", 1);
++	}
+ #endif
+ 
+ #ifdef __arm64__
+@@ -673,6 +749,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2037,6 +2104,86 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+@@ -756,6 +835,8 @@ arm_init_cpu(
+ 	if (should_kprintf) {
+ 		kprintf("arm_cpu_init(): cpu %d online\n", cpu_data_ptr->cpu_number);
+ 	}
++	/* the processor has its thread and its data now: kprintf is safe here (see cpu_speed_probe) */
++	cpu_speed_probe();
+ 
+ 	if (cpu_data_ptr == &BootCpuData) {
+ 		if (kdebug_enable == 0) {
+@@ -793,7 +874,9 @@ arm_init_idle_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	if (arm_pan_present) {
++		__builtin_arm_wsr("pan", 1);
++	}
+ #endif
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba9b463..79e20b08c05c 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,8 +273,19 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
+ 	cbz		w10, Ltrylock_enqueue_success
++#else
++	// ARMv8.0 (no LSE, e.g. the Cortex-A53/A73 class): one load-exclusive/store-exclusive attempt,
++	// so a trylock still never waits
++	ldaxr	w10, [x3]
++	cbnz	w10, Ltrylock_enqueue_clear
++	stxr	w12, w11, [x3]
++	cbz		w12, Ltrylock_enqueue_success
++Ltrylock_enqueue_clear:
++	clrex
++#endif
+ 
+ 	mov		x0, #-1			// Failed
+ 	b Ltrylock_enqueue_exit
+@@ -323,8 +334,17 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
+ 	cbz		w10, Ltrylock_dequeue_success
++#else
++	ldaxr	w10, [x2]		 // as in pfz_trylock_and_enqueue: one exclusive attempt
++	cbnz	w10, Ltrylock_dequeue_clear
++	stxr	w12, w11, [x2]
++	cbz		w12, Ltrylock_dequeue_success
++Ltrylock_dequeue_clear:
++	clrex
++#endif
+ 
+ 	mov		x0, #-1			// Failed
+ 	b Ltrylock_dequeue_exit
+diff --git a/osfmk/arm/misc_protos.h b/osfmk/arm/misc_protos.h
+index d29d1de0df84..db824e6374cf 100644
+--- a/osfmk/arm/misc_protos.h
++++ b/osfmk/arm/misc_protos.h
+@@ -116,6 +116,13 @@ extern boolean_t debug_state_is_valid64(arm_debug_state64_t *ds);
+ 
+ extern int copyio_check_user_addr(user_addr_t user_addr, vm_size_t nbytes);
+ 
++/*
++ * The core has PSTATE.PAN (ID_AA64MMFR1_EL1, read by arm_init()). A __ARM_PAN_AVAILABLE__ kernel
++ * also runs on ARMv8.0 cores without it (Cortex-A53/A73 class: Snapdragon 665), where any access
++ * to PAN is an undefined instruction; there the kernel leaves it alone.
++ */
++extern bool arm_pan_present;
++
+ /*
+  * Get a quick virtual mapping of a physical page and run a callback on that
+  * page's virtual address.
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2066,7 +2213,7 @@ index 39daaf8db949..64ceb1a5f201 100644
  	}
  	os_atomic_clear_exclusive();
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index fc2096fa0010..5011ab612305 100644
+index fc2096fa0010..86007319716f 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -93,6 +93,8 @@
@@ -2119,6 +2266,28 @@ index fc2096fa0010..5011ab612305 100644
  #endif
  }
  
+@@ -13847,7 +13852,9 @@ pmap_test_access(pmap_t pmap, vm_map_address_t va, bool should_fault, bool is_wr
+ 
+ 		/* Disable PAN; pmap shouldn't be the kernel pmap. */
+ #if __ARM_PAN_AVAILABLE__
+-		__builtin_arm_wsr("pan", 0);
++		if (arm_pan_present) {
++			__builtin_arm_wsr("pan", 0);
++		}
+ #endif /* __ARM_PAN_AVAILABLE__ */
+ 	}
+ 
+@@ -13866,7 +13873,9 @@ pmap_test_access(pmap_t pmap, vm_map_address_t va, bool should_fault, bool is_wr
+ 
+ 	if (pmap != NULL) {
+ #if __ARM_PAN_AVAILABLE__
+-		__builtin_arm_wsr("pan", 1);
++		if (arm_pan_present) {
++			__builtin_arm_wsr("pan", 1);
++		}
+ #endif /* __ARM_PAN_AVAILABLE__ */
+ 
+ 		pmap_switch(old_pmap);
 diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
 index df672c65b144..d7e1da7c5db2 100644
 --- a/osfmk/arm/pmap/pmap.h
@@ -2147,6 +2316,99 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
+index 15b949c659ad..b6af593ca7eb 100644
+--- a/osfmk/arm64/copyio.c
++++ b/osfmk/arm64/copyio.c
+@@ -47,6 +47,10 @@ extern int _copyin_atomic32_wait_if_equals(const char *src, uint32_t dst);
+ extern int _copyin_atomic64(const char *src, uint64_t *dst);
+ extern int _copyout_atomic32(uint32_t u32, const char *dst);
+ extern int _copyout_atomic64(uint64_t u64, const char *dst);
++extern int _copy_cas_user32(const char *uaddr, uint32_t expected, uint32_t desired, uint32_t *old);
++extern int _copy_cas_user64(const char *uaddr, uint64_t expected, uint64_t desired, uint64_t *old);
++extern int _copy_casp_user64(const char *uaddr, uint64_t exp_lo, uint64_t exp_hi, uint64_t new_lo,
++    uint64_t new_hi, uint64_t old[2]);
+ 
+ extern int copyoutstr_prevalidate(const void *kaddr, user_addr_t uaddr, size_t len);
+ 
+@@ -86,8 +90,10 @@ static inline void
+ user_access_enable(void)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	assert(__builtin_arm_rsr("pan") != 0);
+-	__builtin_arm_wsr("pan", 0);
++	if (arm_pan_present) {
++		assert(__builtin_arm_rsr("pan") != 0);
++		__builtin_arm_wsr("pan", 0);
++	}
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+ }
+@@ -96,7 +102,9 @@ static inline void
+ user_access_disable(void)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	if (arm_pan_present) {
++		__builtin_arm_wsr("pan", 1);
++	}
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+ }
+@@ -306,6 +314,53 @@ copyout_atomic64(uint64_t value, user_addr_t user_addr)
+ 	return result;
+ }
+ 
++/*
++ * Compare-and-swap on the current task's memory, fully ordered (lse_emulate.c). *old gets the
++ * value that was there; the swap happened when it equals expected.
++ */
++int
++copy_cas_user32(user_addr_t user_addr, uint32_t expected, uint32_t desired, uint32_t *old)
++{
++	int result = copy_validate(user_addr, 0, 4,
++	    COPYIO_OUT | COPYIO_ATOMIC | COPYIO_VALIDATE_USER_ONLY);
++	if (__improbable(result)) {
++		return result;
++	}
++	user_access_enable();
++	result = _copy_cas_user32((const char *)user_addr, expected, desired, old);
++	user_access_disable();
++	return result;
++}
++
++int
++copy_cas_user64(user_addr_t user_addr, uint64_t expected, uint64_t desired, uint64_t *old)
++{
++	int result = copy_validate(user_addr, 0, 8,
++	    COPYIO_OUT | COPYIO_ATOMIC | COPYIO_VALIDATE_USER_ONLY);
++	if (__improbable(result)) {
++		return result;
++	}
++	user_access_enable();
++	result = _copy_cas_user64((const char *)user_addr, expected, desired, old);
++	user_access_disable();
++	return result;
++}
++
++/* Two 64-bit words at a 16-byte aligned address, compared and swapped together. */
++int
++copy_casp_user64(user_addr_t user_addr, const uint64_t expected[2], const uint64_t desired[2], uint64_t old[2])
++{
++	int result = copy_validate(user_addr, 0, 16,
++	    COPYIO_OUT | COPYIO_ATOMIC | COPYIO_VALIDATE_USER_ONLY);
++	if (__improbable(result)) {
++		return result;
++	}
++	user_access_enable();
++	result = _copy_casp_user64((const char *)user_addr, expected[0], expected[1], desired[0], desired[1], old);
++	user_access_disable();
++	return result;
++}
++
+ int
+ copyinstr(const user_addr_t user_addr, char *kernel_addr, vm_size_t nbytes, vm_size_t *lencopied)
+ {
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2382,6 +2644,202 @@ index e76e7e70ab9c..4f540f8caf43 100644
  }
  
  void
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+index 2449334f5c97..d5816471b07a 100644
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -614,6 +614,92 @@ LEXT(_copyout_atomic64)
+ 	POP_FRAME
+ 	ARM64_STACK_EPILOG
+ 
++/*
++ * Compare-and-swap on user memory with ARMv8.0 exclusives, for emulating the ARMv8.1 atomics
++ * (lse_emulate.c) on cores that do not have them. Fully ordered: a barrier on both sides covers
++ * every acquire/release variant of the instruction being emulated. *old gets what was there.
++ *
++ * int _copy_cas_user32(char *uaddr, uint32_t expected, uint32_t desired, uint32_t *old)
++ * int _copy_cas_user64(char *uaddr, uint64_t expected, uint64_t desired, uint64_t *old)
++ * int _copy_casp_user64(char *uaddr, uint64_t exp_lo, uint64_t exp_hi, uint64_t new_lo, uint64_t new_hi,
++ *     uint64_t old[2])
++ */
++	.text
++	.align 2
++	.globl EXT(_copy_cas_user32)
++LEXT(_copy_cas_user32)
++	ARM64_STACK_PROLOG
++	PUSH_FRAME
++	dmb		ish
++	COPYIO_RECOVER_RANGE 3f
++1:
++	ldaxr	w8, [x0]
++	cmp		w8, w1
++	b.ne	2f
++	stlxr	w9, w2, [x0]
++	cbnz	w9, 1b
++	b		3f
++2:
++	clrex
++3:
++	dmb		ish
++	str		w8, [x3]
++	mov		x0, #0
++	POP_FRAME
++	ARM64_STACK_EPILOG
++
++	.text
++	.align 2
++	.globl EXT(_copy_cas_user64)
++LEXT(_copy_cas_user64)
++	ARM64_STACK_PROLOG
++	PUSH_FRAME
++	dmb		ish
++	COPYIO_RECOVER_RANGE 3f
++1:
++	ldaxr	x8, [x0]
++	cmp		x8, x1
++	b.ne	2f
++	stlxr	w9, x2, [x0]
++	cbnz	w9, 1b
++	b		3f
++2:
++	clrex
++3:
++	dmb		ish
++	str		x8, [x3]
++	mov		x0, #0
++	POP_FRAME
++	ARM64_STACK_EPILOG
++
++	.text
++	.align 2
++	.globl EXT(_copy_casp_user64)
++LEXT(_copy_casp_user64)
++	ARM64_STACK_PROLOG
++	PUSH_FRAME
++	dmb		ish
++	COPYIO_RECOVER_RANGE 3f
++1:
++	ldaxp	x8, x9, [x0]
++	cmp		x8, x1
++	ccmp	x9, x2, #0, eq
++	b.ne	2f
++	stlxp	w10, x3, x4, [x0]
++	cbnz	w10, 1b
++	b		3f
++2:
++	// a pair is only single-copy atomic once a store-exclusive of it has succeeded:
++	// write back what was read, as the Arm ARM's sequence for a 128-bit atomic load does
++	stlxp	w10, x8, x9, [x0]
++	cbnz	w10, 1b
++3:
++	dmb		ish
++	stp		x8, x9, [x5]
++	mov		x0, #0
++	POP_FRAME
++	ARM64_STACK_EPILOG
++
+ 
+ /*
+  * int _bcopyout(const char *src, char *dst, vm_size_t len)
+diff --git a/osfmk/arm64/pcb.c b/osfmk/arm64/pcb.c
+index 7b98a3323d3a..4b12fe8f5837 100644
+--- a/osfmk/arm64/pcb.c
++++ b/osfmk/arm64/pcb.c
+@@ -168,7 +168,7 @@ machine_switch_context(thread_t old,
+ 	thread_t retval;
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
++	if (__improbable(arm_pan_present && __builtin_arm_rsr("pan") == 0)) {
+ 		panic("context switch with PAN disabled");
+ 	}
+ #endif
+@@ -511,7 +511,7 @@ machine_stack_handoff(thread_t old,
+ 	vm_offset_t  stack;
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
++	if (__improbable(arm_pan_present && __builtin_arm_rsr("pan") == 0)) {
+ 		panic("stack handoff with PAN disabled");
+ 	}
+ #endif
+diff --git a/osfmk/arm64/platform_tests.c b/osfmk/arm64/platform_tests.c
+index b58b94d1eeb3..40a85d285934 100644
+--- a/osfmk/arm64/platform_tests.c
++++ b/osfmk/arm64/platform_tests.c
+@@ -81,6 +81,7 @@
+ #include <sys/munge.h>
+ #include <machine/cpu_capabilities.h>
+ #include <arm/cpu_data_internal.h>
++#include <arm/misc_protos.h>
+ #include <arm/pmap.h>
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+@@ -1237,7 +1238,7 @@ struct pan_test_thread_args {
+ static void
+ arm64_pan_test_thread(void *arg, wait_result_t __unused wres)
+ {
+-	T_ASSERT(__builtin_arm_rsr("pan") != 0, NULL);
++	T_ASSERT(!arm_pan_present || __builtin_arm_rsr("pan") != 0, NULL);
+ 
+ 	struct pan_test_thread_args *args = arg;
+ 
+@@ -1349,6 +1350,10 @@ arm64_pan_test()
+ 
+ 	T_LOG("Testing PAN.");
+ 
++	if (!arm_pan_present) {
++		T_LOG("No PAN on this core (ARMv8.0): nothing to test.");
++		return KERN_SUCCESS;
++	}
+ 
+ 	T_ASSERT((__builtin_arm_rsr("SCTLR_EL1") & SCTLR_PAN_UNCHANGED) == 0, "SCTLR_EL1.SPAN must be cleared");
+ 
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 133b07fd6155..f2918ba917b6 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -2254,6 +2254,9 @@ typedef enum {
+ #define ID_AA64MMFR1_EL1_AFP_MASK       (0xfull << ID_AA64MMFR1_EL1_AFP_OFFSET)
+ #define ID_AA64MMFR1_EL1_AFP_EN         (1ull << ID_AA64MMFR1_EL1_AFP_OFFSET)
+ 
++#define ID_AA64MMFR1_EL1_PAN_OFFSET     20
++#define ID_AA64MMFR1_EL1_PAN_MASK       (0xfull << ID_AA64MMFR1_EL1_PAN_OFFSET)
++
+ 
+ 
+ #define APSTATE_G_SHIFT  (0)
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 2cc442e05791..d3b9872feed8 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -950,6 +950,26 @@ handle_uncategorized(arm_saved_state_t *state)
+ 		}
+ 	}
+ 
++	/*
++	 * An ARMv8.1 atomic on a core without them: done here (osfmk/arm64/lse_emulate.c).
++	 * One whose memory access failed is the access fault it would have been on a core with LSE.
++	 */
++	{
++		extern bool lse_emulate_user(arm_saved_state_t *state, uint32_t instr, int *error);
++		int lse_error;
++
++		if (lse_emulate_user(state, instr, &lse_error)) {
++			return;
++		}
++		if (lse_error) {
++			exception = EXC_BAD_ACCESS;
++			codes[0] = lse_error == EINVAL ? EXC_ARM_DA_ALIGN : KERN_INVALID_ADDRESS;
++			codes[1] = get_saved_state_reg(state, (instr >> 5) & 31);
++			exception_triage(exception, codes, numcodes);
++			__builtin_unreachable();
++		}
++	}
++
+ 	/*
+ 	 * Check for GDB breakpoint via illegal opcode.
+ 	 */
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5a1cce..a54e35035cde 100644
 --- a/osfmk/arm64/start.s
@@ -2730,7 +3188,7 @@ index 9d98c50094a0..9e3476124e54 100644
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index c40d57bcc677..1b7a1fcdfcdf 100644
+index c40d57bcc677..686128510235 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -25,8 +25,8 @@ osfmk/arm64/WKdmCompress_4k.s	standard
@@ -2744,13 +3202,14 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,8 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +104,9 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
 +osfmk/arm64/generic_arm64_support.c	optional nos_arm_asm
 +osfmk/arm64/loader_return.c	optional nos_arm_asm
 +osfmk/arm64/user_exception_trace.c	standard
++osfmk/arm64/lse_emulate.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c

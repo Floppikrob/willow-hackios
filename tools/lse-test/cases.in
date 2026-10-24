@@ -1,0 +1,92 @@
+/* every instruction between at-signs is replaced by its encoding (llvm-mc) by gen.py */
+static void run_cases(void)
+{
+	int err;
+
+	puts("ldadd w1, w2, [x3]");
+	reset(); put32(8, 5); st.x[1] = 3; st.x[3] = BASE + 8;
+	EXPECT(run(@ldadd w1, w2, [x3]@, &err)); EXPECT(get32(8) == 8); EXPECT(st.x[2] == 5); EXPECT(st.pc == 0x1004);
+
+	puts("ldaddal x1, x2, [sp] (64-bit, base sp)");
+	reset(); put64(16, 0xFFFFFFFFFFFFFFFFULL); st.x[1] = 2; st.sp = BASE + 16;
+	EXPECT(run(@ldaddal x1, x2, [sp]@, &err)); EXPECT(get64(16) == 1); EXPECT(st.x[2] == 0xFFFFFFFFFFFFFFFFULL);
+
+	puts("ldaddalb w1, w2, [x3]: a byte, the bytes around it untouched, wraps at 8 bits");
+	reset(); put32(8, 0xAABBFFCC); st.x[1] = 2; st.x[3] = BASE + 9;
+	EXPECT(run(@ldaddalb w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0xAABB01CC); EXPECT(st.x[2] == 0xFF);
+
+	puts("ldsetlh w1, w2, [x3]: halfword at offset 2");
+	reset(); put32(8, 0x00F01234); st.x[1] = 0x0F0F; st.x[3] = BASE + 10;
+	EXPECT(run(@ldsetlh w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0x0FFF1234); EXPECT(st.x[2] == 0x00F0);
+
+	puts("ldclr / ldeor / ldumax / ldumin / ldsmax / ldsmin");
+	reset(); put32(8, 0xFF); st.x[1] = 0x0F; st.x[3] = BASE + 8;
+	EXPECT(run(@ldclr w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0xF0);
+	reset(); put32(8, 0xFF); st.x[1] = 0x0F; st.x[3] = BASE + 8;
+	EXPECT(run(@ldeora w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0xF0);
+	reset(); put32(8, 0xFFFFFFFF); st.x[1] = 1; st.x[3] = BASE + 8;
+	EXPECT(run(@ldumax w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0xFFFFFFFF);
+	reset(); put32(8, 0xFFFFFFFF); st.x[1] = 1; st.x[3] = BASE + 8;
+	EXPECT(run(@ldumin w1, w2, [x3]@, &err)); EXPECT(get32(8) == 1);
+	reset(); put32(8, 0xFFFFFFFF); st.x[1] = 1; st.x[3] = BASE + 8;
+	EXPECT(run(@ldsmax w1, w2, [x3]@, &err)); EXPECT(get32(8) == 1); EXPECT(st.x[2] == 0xFFFFFFFF);
+	reset(); put32(8, 0xFFFF); st.x[1] = 1; st.x[3] = BASE + 8;
+	EXPECT(run(@ldsminh w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0xFFFF);
+	reset(); put32(8, 5); st.x[1] = 0xFFFFFFFFFFFFFFFFULL; st.x[3] = BASE + 8;
+	EXPECT(run(@ldsmin x1, x2, [x3]@, &err)); EXPECT(get64(8) == 0xFFFFFFFFFFFFFFFFULL); EXPECT(st.x[2] == 5);
+
+	puts("stadd w1, [x3] (Rt = xzr: no register written)");
+	reset(); put32(8, 1); st.x[1] = 1; st.x[3] = BASE + 8;
+	EXPECT(run(@stadd w1, [x3]@, &err)); EXPECT(get32(8) == 2);
+
+	puts("swpal x1, x2, [x3]");
+	reset(); put64(8, 7); st.x[1] = 9; st.x[3] = BASE + 8;
+	EXPECT(run(@swpal x1, x2, [x3]@, &err)); EXPECT(get64(8) == 9); EXPECT(st.x[2] == 7);
+
+	puts("swp wzr, w8, [x8] (as libdispatch has it)");
+	reset(); put32(8, 0x1234); st.x[8] = BASE + 8;
+	EXPECT(run(@swp wzr, w8, [x8]@, &err)); EXPECT(get32(8) == 0); EXPECT(st.x[8] == 0x1234);
+
+	puts("casal w1, w2, [x3]: success, then failure");
+	reset(); put32(8, 4); st.x[1] = 4; st.x[2] = 6; st.x[3] = BASE + 8;
+	EXPECT(run(@casal w1, w2, [x3]@, &err)); EXPECT(get32(8) == 6); EXPECT(st.x[1] == 4);
+	reset(); put32(8, 5); st.x[1] = 4; st.x[2] = 6; st.x[3] = BASE + 8;
+	EXPECT(run(@casal w1, w2, [x3]@, &err)); EXPECT(get32(8) == 5); EXPECT(st.x[1] == 5); EXPECT(stores == 0);
+
+	puts("casa x1, x2, [x3] / casb / cash");
+	reset(); put64(8, 0x1122334455667788ULL); st.x[1] = 0x1122334455667788ULL; st.x[2] = 1; st.x[3] = BASE + 8;
+	EXPECT(run(@casa x1, x2, [x3]@, &err)); EXPECT(get64(8) == 1);
+	reset(); put32(8, 0x11223344); st.x[1] = 0x22; st.x[2] = 0x99; st.x[3] = BASE + 10;
+	EXPECT(run(@casb w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0x11993344); EXPECT(st.x[1] == 0x22);
+	reset(); put32(8, 0x11223344); st.x[1] = 0x1122; st.x[2] = 0xABCD; st.x[3] = BASE + 10;
+	EXPECT(run(@cash w1, w2, [x3]@, &err)); EXPECT(get32(8) == 0xABCD3344);
+
+	puts("caspal x0, x1, x2, x3, [x4]: success, then failure");
+	reset(); put64(16, 1); put64(24, 2); st.x[0] = 1; st.x[1] = 2; st.x[2] = 3; st.x[3] = 4; st.x[4] = BASE + 16;
+	EXPECT(run(@caspal x0, x1, x2, x3, [x4]@, &err)); EXPECT(get64(16) == 3); EXPECT(get64(24) == 4);
+	EXPECT(st.x[0] == 1); EXPECT(st.x[1] == 2);
+	reset(); put64(16, 1); put64(24, 5); st.x[0] = 1; st.x[1] = 2; st.x[2] = 3; st.x[3] = 4; st.x[4] = BASE + 16;
+	EXPECT(run(@caspal x0, x1, x2, x3, [x4]@, &err)); EXPECT(get64(16) == 1); EXPECT(st.x[1] == 5);
+
+	puts("casp w0, w1, w2, w3, [x4]");
+	reset(); put32(8, 1); put32(12, 2); st.x[0] = 1; st.x[1] = 2; st.x[2] = 7; st.x[3] = 8; st.x[4] = BASE + 8;
+	EXPECT(run(@casp w0, w1, w2, w3, [x4]@, &err)); EXPECT(get32(8) == 7); EXPECT(get32(12) == 8);
+
+	puts("ldaprb w1, [x3] / ldapr x1, [x3]: loads, no store");
+	reset(); put32(8, 0x11223344); st.x[3] = BASE + 9;
+	EXPECT(run(@ldaprb w1, [x3]@, &err)); EXPECT(st.x[1] == 0x33); EXPECT(stores == 0);
+	reset(); put64(8, 0x0102030405060708ULL); st.x[3] = BASE + 8;
+	EXPECT(run(@ldapr x1, [x3]@, &err)); EXPECT(st.x[1] == 0x0102030405060708ULL);
+
+	puts("errors: misaligned, outside memory, not an LSE instruction");
+	reset(); st.x[3] = BASE + 9;
+	EXPECT(!run(@ldadd w1, w2, [x3]@, &err)); EXPECT(err == EINVAL); EXPECT(st.pc == 0x1000);
+	reset(); st.x[3] = 0x10;
+	EXPECT(!run(@ldadd w1, w2, [x3]@, &err)); EXPECT(err == EFAULT);
+	reset(); st.x[4] = BASE + 8;
+	EXPECT(!run(@caspal x0, x1, x2, x3, [x4]@, &err)); EXPECT(err == EINVAL);
+	reset();
+	EXPECT(!run(@ldxr w1, [x3]@, &err)); EXPECT(err == 0);
+	EXPECT(!run(@add x1, x2, x3@, &err)); EXPECT(err == 0);
+	EXPECT(!run(@fadd h0, h1, h2@, &err)); EXPECT(err == 0);
+}

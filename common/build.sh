@@ -37,7 +37,7 @@ fi
 
 if ! skip loader; then
 	if command -v clang >/dev/null && command -v lld-link >/dev/null; then
-		xnuloader/build.sh && echo "build: loader xnuloader/loader.efi"
+		LOADER_BASE=$LOADER_BASE xnuloader/build.sh && echo "build: loader xnuloader/loader.efi"
 	else
 		echo "build: no clang/lld-link: using prebuilt/loader.efi"
 	fi
@@ -54,6 +54,7 @@ if ! skip boot && [ "$KIND" = phone ]; then
 	L=xnuloader/loader.efi; [ -f $L ] || L=prebuilt/loader.efi
 	python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=$L --usb > /dev/null
 	FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE UEFI_FD=$UEFI_FD DTB=$DTB UEFI_TARGET=$UEFI_TARGET \
+	BOOT_HEADER=$BOOT_HEADER TEXT_OFFSET=$TEXT_OFFSET \
 		python3 mkxnuimg.py -p out/usb-payload.bin -o out/$DEVICE-boot.img
 	echo "build: out/$DEVICE-boot.img -- boot it with: fastboot boot out/$DEVICE-boot.img (or common/run.sh $DEVICE)"
 fi
