@@ -573,6 +573,9 @@ static const struct platform platform_willow = {
 	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
 };
 
+/* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
+static uint32_t small_cores_now;
+
 /* The MPIDR of core N, and the other way round (-1: not one of the platform's cores). */
 static uint64_t
 platform_core_mpidr(const struct platform *plat, int core)
@@ -2997,6 +3000,57 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 
+	/*
+	 * willow, "osm=1" or "osm=2": the cores' clocks, through the OSM of each cluster (qcom,clk-cpu-osm-
+	 * trinket; Linux's clk-cpu-osm in sequenced mode). Each core asks for a row of its cluster's table
+	 * at 0x920 + 4 * core; the OSM runs the cluster at the highest row asked for and sets the voltage
+	 * of that row itself (the table's second word). The kernel has no clock driver for this SoC, so the
+	 * clocks stay as set here for the run: osm=1 Silver 1804 MHz (row 7), Gold 1804 MHz (row 6) --
+	 * a row below the top, nothing in this port watches the temperature (the hardware's LMh still
+	 * does) -- and osm=2 both at their top (Silver 1804, Gold 2016). Without it the firmware's state
+	 * stays: Gold at 300 MHz (row 0), and the Gold cores the slower ones.
+	 */
+	small_cores_now = PLAT->small_cores;
+	if (PLAT == &platform_willow) {
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "osm=") && (c == pi.cmdline || c[-1] == ' ') && (c[4] == '1' || c[4] == '2') &&
+			    (c[5] == 0 || c[5] == ' ')) {
+				static const uint64_t osm[2] = { 0x0F521000ULL, 0x0F523000ULL };
+				const uint32_t row[2] = { 7, c[4] == '2' ? 7 : 6 };
+				uint64_t f = READ_SYSREG(CNTFRQ_EL0), reg = 0, t0, t1;
+
+				for (int k = 0; k < 2; k++) {
+					volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)osm[k];
+
+					for (int core = 0; core < 4; core++) {
+						r[0x920 / 4 + core] = row[k];
+					}
+					__asm__ volatile ("dsb sy" ::: "memory");
+					print("osm %x: rows asked for %x %x %x %x (row %d: %d MHz)\n", osm[k], (uint64_t)r[0x920 / 4],
+					    (uint64_t)r[0x924 / 4], (uint64_t)r[0x928 / 4], (uint64_t)r[0x92c / 4], (uint64_t)row[k],
+					    (uint64_t)(r[(0x110 + 32 * row[k]) / 4] & 0xff) * 192 / 10);
+				}
+				/* settle, then this core's clock again: it is a Silver one */
+				t0 = READ_SYSREG(CNTVCT_EL0);
+				while (READ_SYSREG(CNTVCT_EL0) - t0 < f / 100) {
+				}
+				t0 = READ_SYSREG(CNTVCT_EL0);
+				for (uint64_t i = 0; i < 60000000ULL; i++) {
+					__asm__ volatile ("add %0, %0, %1" : "+r" (reg) : "r" (i));
+				}
+				t1 = READ_SYSREG(CNTVCT_EL0);
+				print("osm: this core now %d MHz if one add a cycle\n", t1 == t0 ? 0 : 60000000ULL * f / (t1 - t0) / 1000000);
+				/*
+				 * Gold stays the slower cluster: its OSM is not enabled by the firmware (enable 2,
+				 * Silver's 3), and neither this request nor one from its own cores once they are up
+				 * (XNU's osmc=) moves it off 300 MHz (cpuprobe=1, 2026-10-24). Turning that OSM on is
+				 * left alone: its sequencer sets the voltage, and nothing here knows it is set up.
+				 */
+				break;
+			}
+		}
+	}
+
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
@@ -3375,7 +3429,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
 		int core = platform_mpidr_core(plat, cpu_mpidr[i]);
 
-		if (core >= 0 && (plat->small_cores & (1u << (core & 31)))) {
+		if (core >= 0 && (small_cores_now & (1u << (core & 31)))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);

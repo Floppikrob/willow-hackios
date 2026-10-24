@@ -1878,7 +1878,7 @@ index 0316792a3f42..bbef0a4b26d4 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..cad113dce42c 100644
+index e26a1d70f470..722c74face07 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -1891,7 +1891,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  #include <console/serial_protos.h>
  
-@@ -169,6 +172,40 @@ SECURITY_READ_ONLY_LATE(uint64_t) gDramBase;
+@@ -169,6 +172,95 @@ SECURITY_READ_ONLY_LATE(uint64_t) gDramBase;
  SECURITY_READ_ONLY_LATE(uint64_t) gDramSize;
  
  SECURITY_READ_ONLY_LATE(bool) serial_console_enabled = false;
@@ -1906,6 +1906,61 @@ index e26a1d70f470..cad113dce42c 100644
 + * slow (willow: cpu_test 50 times slower under the kernel than the same loop under UEFI).
 + */
 +static bool cpu_speed_probe_wanted;
++
++/*
++ * Boot-arg osmc=BASE:ROW (hex base, decimal row): the clock of one cluster through its OSM (Qualcomm's
++ * Operating State Manager, qcom,clk-cpu-osm-* in Linux, sequenced mode): each core of that cluster
++ * asks for row ROW of the OSM's table at BASE + 0x920 + 4 * core, as it comes up, and the OSM runs
++ * the cluster at the highest row asked for, the voltage of that row set by itself. For a cluster
++ * the firmware brings up with PSCI at its lowest row and that forgets, while it is powered off,
++ * what was asked for before (willow's Gold cluster: xnuloader sets Silver itself and passes
++ * osmc=f523000:6 for Gold). Which cores are that cluster's: those whose MPIDR Aff1 is BASE's
++ * cluster number, the second OSM block (BASE & 0x2000) being cluster 1.
++ */
++static volatile uint32_t *osm_regs;
++static uint32_t osm_row, osm_cluster;
++
++static void
++osm_ask(void)
++{
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	uint64_t f = __builtin_arm_rsr64("CNTFRQ_EL0"), t0;
++
++	if (osm_regs == NULL || ((mpidr >> 8) & 0xff) != osm_cluster) {
++		return;
++	}
++	osm_regs[0x920 / 4 + (mpidr & 3)] = osm_row;
++	__builtin_arm_dsb(DSB_SY);
++	t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++	while (__builtin_arm_rsr64("CNTVCT_EL0") - t0 < f / 1000) {   /* 1 ms to switch */
++	}
++}
++
++static void
++osm_setup(void)
++{
++	char arg[32];
++
++	if (!PE_parse_boot_argn("osmc", arg, sizeof(arg))) {
++		return;
++	}
++	uint64_t base = 0;
++	const char *c = arg;
++	for (; *c && *c != ':'; c++) {
++		uint64_t d = (*c >= '0' && *c <= '9') ? (uint64_t)(*c - '0') : (*c >= 'a' && *c <= 'f') ? (uint64_t)(*c - 'a' + 10) : 16;
++		if (d == 16) {
++			return;
++		}
++		base = base * 16 + d;
++	}
++	if (*c != ':' || c[1] < '0' || c[1] > '9' || base == 0) {
++		return;
++	}
++	osm_row = (uint32_t)(c[1] - '0');
++	osm_cluster = (base & 0x2000) ? 1 : 0;
++	osm_regs = (volatile uint32_t *)ml_io_map(base, 0x1000);
++	kprintf("osm: cluster %u's cores ask for row %u of the OSM at %llx\n", osm_cluster, osm_row, base);
++}
 +
 +static void
 +cpu_speed_probe(void)
@@ -1932,7 +1987,7 @@ index e26a1d70f470..cad113dce42c 100644
  #ifdef XNU_ENABLE_PROCESSOR_EXIT
  SECURITY_READ_ONLY_LATE(bool) enable_processor_exit = true;
  #else
-@@ -335,7 +372,11 @@ arm_setup_pre_sign(void)
+@@ -335,7 +427,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -1944,7 +1999,7 @@ index e26a1d70f470..cad113dce42c 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +395,7 @@ arm_init(
+@@ -354,6 +450,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -1952,7 +2007,7 @@ index e26a1d70f470..cad113dce42c 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +404,19 @@ arm_init(
+@@ -362,14 +459,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -1972,7 +2027,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +432,7 @@ arm_init(
+@@ -385,6 +487,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -1980,7 +2035,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +470,13 @@ arm_init(
+@@ -422,10 +525,13 @@ arm_init(
  	}
  #endif
  
@@ -1994,7 +2049,7 @@ index e26a1d70f470..cad113dce42c 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +490,14 @@ arm_init(
+@@ -439,11 +545,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -2009,7 +2064,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +506,16 @@ arm_init(
+@@ -452,12 +561,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -2026,7 +2081,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +523,7 @@ arm_init(
+@@ -465,6 +578,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -2034,7 +2089,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  	processor_bootstrap();
  
-@@ -510,10 +569,20 @@ arm_init(
+@@ -510,10 +624,20 @@ arm_init(
  	PE_parse_boot_argn("immediate_NMI", &force_immediate_debug_halt, sizeof(force_immediate_debug_halt));
  
  #if __ARM_PAN_AVAILABLE__
@@ -2056,7 +2111,7 @@ index e26a1d70f470..cad113dce42c 100644
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +596,9 @@ arm_init(
+@@ -527,7 +651,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2066,7 +2121,7 @@ index e26a1d70f470..cad113dce42c 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +640,7 @@ arm_init(
+@@ -569,6 +695,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2074,16 +2129,18 @@ index e26a1d70f470..cad113dce42c 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +719,8 @@ arm_init(
+@@ -647,6 +774,10 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
 +	loader_checkpoint(21);
++	osm_setup();
++	osm_ask();
 +	cpu_speed_probe();          /* the boot processor's (cpuprobe=1) */
  	machine_startup(args);
  }
  
-@@ -661,7 +735,9 @@ arm_init_cpu(
+@@ -661,7 +792,9 @@ arm_init_cpu(
  	cpu_data_t      *cpu_data_ptr)
  {
  #if __ARM_PAN_AVAILABLE__
@@ -2094,7 +2151,7 @@ index e26a1d70f470..cad113dce42c 100644
  #endif
  
  #ifdef __arm64__
-@@ -673,6 +749,9 @@ arm_init_cpu(
+@@ -673,6 +806,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2104,16 +2161,17 @@ index e26a1d70f470..cad113dce42c 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
-@@ -756,6 +835,8 @@ arm_init_cpu(
+@@ -756,6 +892,9 @@ arm_init_cpu(
  	if (should_kprintf) {
  		kprintf("arm_cpu_init(): cpu %d online\n", cpu_data_ptr->cpu_number);
  	}
 +	/* the processor has its thread and its data now: kprintf is safe here (see cpu_speed_probe) */
++	osm_ask();
 +	cpu_speed_probe();
  
  	if (cpu_data_ptr == &BootCpuData) {
  		if (kdebug_enable == 0) {
-@@ -793,7 +874,9 @@ arm_init_idle_cpu(
+@@ -793,7 +932,9 @@ arm_init_idle_cpu(
  	cpu_data_t      *cpu_data_ptr)
  {
  #if __ARM_PAN_AVAILABLE__
