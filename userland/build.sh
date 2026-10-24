@@ -558,6 +558,12 @@ if [ -f ../fw-touch/novatek_ts_fw.bin ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-touch/novatek_ts_fw.bin root/fw/
 fi
+# ... and willow's GPU (Adreno 610): its zap shader and the command processor's microcode, from the
+# phone's /vendor/firmware into ../fw-a610 (bsd/dev/redwood_a610.c; 60 KB)
+if [ -f ../fw-a610/a610_zap.mdt ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-a610/a610_zap.mdt ../fw-a610/a610_zap.b0[0-9] ../fw-a610/a630_sqe.fw root/fw/
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (bsd/dev/redwood_wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
