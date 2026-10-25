@@ -169,6 +169,11 @@ static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
  * phone while it runs; the log says all of it as well.
  */
 static TUNABLE(uint32_t, gHud, "fb_hud", 0);
+/*
+ * Boot-arg fb_gpu=1: a frame the GPU drew, not scaled, is copied onto the panel by the GPU's 2D engine
+ * (RedwoodGPUBlitToPanel), not row by row by the processors; anything else is copied as before.
+ */
+static TUNABLE(uint32_t, gFBGPU, "fb_gpu", 0);
 extern "C" {
 extern unsigned char iso_font[256 * 16];
 enum { kStatusScreen = 0, kStatusParts = 10 };  /* REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_PARTS (sys/redwood_input.h) */
@@ -322,6 +327,7 @@ public:
 	uint64_t        fHudSecond;             /* ... the second being counted, and its frames */
 	uint32_t        fHudFrames, fHudFps, fHudIntervalUs, fHudDriverUs;
 	uint32_t *      fHudPixels;             /* ... the panel as last drawn, copied into every frame */
+	uint32_t        fGPUFrames;             /* fb_gpu=1: frames the GPU copied onto the panel (in the 5-second line) */
 	uint64_t        fHudDrawn;              /* ... when it was drawn: twice a second */
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
@@ -893,6 +899,14 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.cx1 = cx1;
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	if (gFBGPU && job.unscaled && s->drawn != 0 && !fDiff && py0 >= 0 && (uint32_t) py1 <= fPanelHeight &&
+	    vinfo.v_physaddr != 0 && RedwoodGPUBlitToPanel(s, (uint32_t) sx, (uint32_t) sy, (uint32_t) sw, (uint32_t) sh,
+	    (uint32_t) px0, (uint32_t) py0, gFBGPU == 2 ? 0 : vinfo.v_physaddr, fRowBytes, fPanelHeight)) {
+		fGPUFrames++;
+		if (gFBGPU != 2) {
+			return;
+		}
+	}
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
@@ -1170,11 +1184,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
+		    "%u gave up; %u swaps came a refresh late themselves; %u copied by the GPU\n", fStatFrames, nanos / NSEC_PER_MSEC,
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate);
+		    fStatHeld, fStatLost, fStatSwapsLate, fGPUFrames);
 		fStatSwapsLate = 0;
+		fGPUFrames = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}
 		if (different == 8 && fStatFrames > 8) {

@@ -270,6 +270,242 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 }
 
 /*
+ * The frame onto the panel by the GPU (fb_gpu=1): the 2D engine copies the window server's surface
+ * into the panel's memory, as Mesa's fd6_blitter copies a buffer (emit_blit_setup, emit_blit_buffer,
+ * emit_blit_fini; the A610's RB_DBG_ECO_CNTL_blit from freedreno_devices.py), in place of the
+ * processor's 8 to 15 ms a frame. The engine wants addresses and row pitches in 64 bytes; the panel's
+ * rows are 4320 bytes, so the even rows go in one blit and the odd in another, each with a pitch of two
+ * rows (8640 = 135 x 64) and its start aligned down, the difference taken up as a shift in x (Mesa does
+ * the same for buffers). The panel is entered into the GPU's addresses once, a surface the first time
+ * it is shown (the last four kept, held); the commands are one indirect buffer of ours.
+ */
+#define BLIT_SURFACES           4
+#define BLIT_COMMANDS_BYTES     4096
+#define BLIT_FORMAT_8888        0x30
+#define BLIT_SWAP_WZYX          (1u << 10)
+#define BLIT_CNTL_COPY_8888     (BLIT_FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24)     /* all channels, R2D_UNORM8 */
+#define BLIT_SRC_INFO           (BLIT_FORMAT_8888 | BLIT_SWAP_WZYX | 1u << 20 | 1u << 22)     /* UNK20, UNK22 as Mesa */
+#define BLIT_DST_INFO           (BLIT_FORMAT_8888 | BLIT_SWAP_WZYX)
+#define BLIT_ECO_A610           0x04100000u
+#define BLIT_CCU_BYPASS_A610    ((0x10000u >> 12 << 23) | 1)    /* redwood_a610.c: A610_CCU_CNTL_BYPASS, no GMEM fast clear */
+
+static struct {
+	MiniIOSurface * surface;
+	uint64_t        address, size, used;
+} gBlitSurface[BLIT_SURFACES];
+static uint64_t gBlitUse, gBlitPanel, gBlitPanelSize, gBlitCommandsAt;
+static IOBufferMemoryDescriptor * gBlitCommands, * gBlitStandIn;
+static uint32_t gBlitSaid;
+
+static uint32_t
+blitParity(uint32_t v)
+{
+	return 0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1;
+}
+
+static void
+blitRegister(uint32_t * w, uint32_t * n, uint32_t reg, uint32_t value)
+{
+	w[(*n)++] = 4u << 28 | 1 | blitParity(1) << 7 | reg << 8 | blitParity(reg) << 27;
+	w[(*n)++] = value;
+}
+
+static void
+blitCommand(uint32_t * w, uint32_t * n, uint32_t opcode, uint32_t words)
+{
+	w[(*n)++] = 7u << 28 | words | blitParity(words) << 15 | opcode << 16 | blitParity(opcode) << 23;
+}
+
+/*
+ * A cache event. The "..._TS" ones (PC_CCU_FLUSH_COLOR_TS 0x1d, PC_CCU_FLUSH_DEPTH_TS 0x1c) write a
+ * timestamp when they are done and take its address and value: given one word, the command processor
+ * reads the next commands as that address. Ours goes into the commands buffer's last words, unused.
+ */
+#define BLIT_TIMESTAMP_AT       (BLIT_COMMANDS_BYTES - 64)
+
+static void
+blitEvent(uint32_t * w, uint32_t * n, uint32_t event)
+{
+	if (event == 0x1d || event == 0x1c) {
+		uint64_t at = gBlitCommandsAt + BLIT_TIMESTAMP_AT;
+
+		blitCommand(w, n, 0x46, 4);             /* CP_EVENT_WRITE */
+		w[(*n)++] = event;
+		w[(*n)++] = (uint32_t) at;
+		w[(*n)++] = (uint32_t) (at >> 32);
+		w[(*n)++] = 0;
+	} else {
+		blitCommand(w, n, 0x46, 1);
+		w[(*n)++] = event;
+	}
+}
+
+/* Physical pages [phys, phys + size) at a new address of the GPU's; 0 if not. With the lock held. */
+static uint64_t
+blitMapPhys(uint64_t phys, uint64_t size)
+{
+	uint64_t address = redwood_gpu_address(size);
+	bool mapped = address != 0;
+
+	for (uint64_t at = 0; mapped && at < size; at += 4096) {
+		mapped = redwood_gpu_map(address + at, phys + at, false);
+	}
+	redwood_gpu_mapped();
+	if (!mapped && address != 0) {
+		redwood_gpu_unmap(address, size);
+		redwood_gpu_address_free(address, size);
+		address = 0;
+	}
+	return address;
+}
+
+/* Where a surface's pixel memory is for the GPU; 0 if it cannot be. With the lock held. */
+static uint64_t
+blitSurface(MiniIOSurface * s)
+{
+	uint32_t slot = 0;
+	uint64_t size, address;
+	bool mapped = true;
+
+	for (uint32_t i = 0; i < BLIT_SURFACES; i++) {
+		if (gBlitSurface[i].surface == s) {
+			gBlitSurface[i].used = ++gBlitUse;
+			return gBlitSurface[i].address;
+		}
+		if (gBlitSurface[i].used < gBlitSurface[slot].used) {
+			slot = i;
+		}
+	}
+	if (s->client != NULL || (size = round_page_64(s->info.allocSize)) == 0 || size > GPU_BUFFER_MAX ||
+	    (address = redwood_gpu_address(size)) == 0) {
+		return 0;
+	}
+	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+		IOByteCount length = 0;
+		addr64_t phys = s->memory->getPhysicalSegment(PAGE_SIZE + offset, &length, kIOMemoryMapperNone);
+
+		mapped = phys != 0 && redwood_gpu_map(address + offset, phys, true);
+	}
+	redwood_gpu_mapped();
+	if (!mapped) {
+		redwood_gpu_unmap(address, size);
+		redwood_gpu_address_free(address, size);
+		return 0;
+	}
+	if (gBlitSurface[slot].surface != NULL) {
+		redwood_gpu_unmap(gBlitSurface[slot].address, gBlitSurface[slot].size);
+		redwood_gpu_address_free(gBlitSurface[slot].address, gBlitSurface[slot].size);
+		MiniIOSurfaceDrop(gBlitSurface[slot].surface);
+	}
+	gBlitSurface[slot].surface = MiniIOSurfaceCopy(s->sid);        /* held while it is mapped */
+	gBlitSurface[slot].address = address;
+	gBlitSurface[slot].size = size;
+	gBlitSurface[slot].used = ++gBlitUse;
+	return address;
+}
+
+bool
+RedwoodGPUBlitToPanel(MiniIOSurface * s, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, uint32_t dx, uint32_t dy,
+    uint64_t panelPhys, uint32_t rowBytes, uint32_t panelHeight)
+{
+	uint32_t * words, n = 0, fence;
+	uint64_t source, srcRow = s->info.bytesPerRow, address;
+	bool done;
+
+	if (gGPULock == NULL || h == 0 || w == 0 || (2 * srcRow) % 64 != 0 || (2 * rowBytes) % 64 != 0 ||
+	    s->info.bytesPerElement != 4 || w + 16 > 0x4000 || h > 2 * 0x4000) {
+		return false;
+	}
+	IOLockLock(gGPULock);
+	if (!redwood_gpu_ready() || gGPUReported) {
+		IOLockUnlock(gGPULock);
+		return false;
+	}
+	if (gBlitCommands == NULL) {
+		gBlitCommands = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, BLIT_COMMANDS_BYTES, 0xfffff000ull);
+		gBlitPanelSize = round_page_64((uint64_t) rowBytes * panelHeight);
+		if (panelPhys == 0) {
+			/* fb_gpu=2, a test: a buffer of ours in place of the panel, the frame's copy written there */
+			gBlitStandIn = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, gBlitPanelSize, 0xfffff000ull);
+			IOLog("RedwoodGPU: fb_gpu=2: the frame is copied into a buffer of ours (%s), not the panel\n",
+			    gBlitStandIn ? "made" : "NOT made");
+		}
+		if (gBlitStandIn != NULL) {
+			panelPhys = gBlitStandIn->getPhysicalAddress();
+		}
+		gBlitPanel = blitMapPhys(panelPhys & ~0xfffull, gBlitPanelSize + 4096);
+		gBlitCommandsAt = gBlitCommands != NULL ? blitMapPhys(gBlitCommands->getPhysicalAddress(), BLIT_COMMANDS_BYTES) : 0;
+		IOLog("RedwoodGPU: frames onto the panel by the GPU: the panel at %#llx (%llu KB), commands at %#llx\n",
+		    gBlitPanel, gBlitPanelSize >> 10, gBlitCommandsAt);
+	}
+	if (gBlitPanel == 0 || gBlitCommandsAt == 0 || (source = blitSurface(s)) == 0) {
+		IOLockUnlock(gGPULock);
+		return false;
+	}
+	source += s->info.offset;
+	if (gBlitStandIn != NULL) {
+		panelPhys = gBlitStandIn->getPhysicalAddress();
+	}
+	address = gBlitPanel + (panelPhys & 0xfff);
+	words = (uint32_t *) gBlitCommands->getBytesNoCopy();
+
+	/* Mesa's emit_setup: the colour and depth caches flushed and invalidated, the colour cache in bypass */
+	for (uint32_t i = 0; i < 4; i++) {
+		static const uint32_t events[4] = { 0x1d, 0x19, 0x1c, 0x18 };    /* PC_CCU_FLUSH/INVALIDATE_COLOR/DEPTH */
+
+		blitEvent(words, &n, events[i]);
+	}
+	blitRegister(words, &n, 0x8e07, BLIT_CCU_BYPASS_A610);         /* RB_CCU_CNTL */
+	blitRegister(words, &n, 0x8c00, BLIT_CNTL_COPY_8888);          /* RB_2D_BLIT_CNTL */
+	blitRegister(words, &n, 0x8400, BLIT_CNTL_COPY_8888);          /* GRAS_2D_BLIT_CNTL */
+	blitRegister(words, &n, 0xacc0, 1 | BLIT_FORMAT_8888 << 3 | 0xfu << 12);       /* SP_2D_DST_FORMAT */
+	blitRegister(words, &n, 0x8c01, 0);                             /* RB_2D_UNKNOWN_8C01 */
+	for (uint32_t parity = 0; parity < 2 && parity < h; parity++) {
+		uint64_t from = source + (uint64_t) (sy + parity) * srcRow + (uint64_t) sx * 4;
+		uint64_t to = address + (uint64_t) (dy + parity) * rowBytes + (uint64_t) dx * 4;
+		uint32_t sshift = (uint32_t) (from & 63) / 4, dshift = (uint32_t) (to & 63) / 4, rows = (h - parity + 1) / 2;
+
+		if ((from & 3) || (to & 3)) {
+			IOLockUnlock(gGPULock);
+			return false;
+		}
+		from &= ~63ull;
+		to &= ~63ull;
+		blitRegister(words, &n, 0xb4c0, BLIT_SRC_INFO);                         /* SP_PS_2D_SRC_INFO */
+		blitRegister(words, &n, 0xb4c1, (sshift + w) | rows << 15);             /* SP_PS_2D_SRC_SIZE */
+		blitRegister(words, &n, 0xb4c2, (uint32_t) from);                       /* SP_PS_2D_SRC */
+		blitRegister(words, &n, 0xb4c3, (uint32_t) (from >> 32));
+		blitRegister(words, &n, 0xb4c4, (uint32_t) (2 * srcRow >> 6) << 9);     /* SP_PS_2D_SRC_PITCH */
+		blitRegister(words, &n, 0x8c17, BLIT_DST_INFO);                         /* RB_2D_DST_INFO */
+		blitRegister(words, &n, 0x8c18, (uint32_t) to);                         /* RB_2D_DST */
+		blitRegister(words, &n, 0x8c19, (uint32_t) (to >> 32));
+		blitRegister(words, &n, 0x8c1a, (uint32_t) (2 * rowBytes >> 6));        /* RB_2D_DST_PITCH */
+		blitRegister(words, &n, 0x8401, sshift << 8);                           /* GRAS_2D_SRC_TL_X: in 1/256 */
+		blitRegister(words, &n, 0x8402, (sshift + w - 1) << 8);                 /* GRAS_2D_SRC_BR_X */
+		blitRegister(words, &n, 0x8403, 0);                                     /* GRAS_2D_SRC_TL_Y */
+		blitRegister(words, &n, 0x8404, (rows - 1) << 8);                       /* GRAS_2D_SRC_BR_Y */
+		blitRegister(words, &n, 0x8405, dshift);                                /* GRAS_2D_DST_TL */
+		blitRegister(words, &n, 0x8406, (dshift + w - 1) | (rows - 1) << 16);   /* GRAS_2D_DST_BR */
+		blitCommand(words, &n, 0x26, 0);                                        /* CP_WAIT_FOR_IDLE */
+		blitRegister(words, &n, 0x8e04, BLIT_ECO_A610);                         /* RB_DBG_ECO_CNTL: the blit's */
+		blitCommand(words, &n, 0x2c, 1);                                        /* CP_BLIT */
+		words[n++] = 3;                                                         /* BLIT_OP_SCALE */
+		blitCommand(words, &n, 0x26, 0);
+	}
+	blitEvent(words, &n, 0x1d);                                                     /* the colour cache out to memory */
+	redwood_gpu_to_memory(words, n * 4);
+	fence = redwood_gpu_submit(&gBlitCommandsAt, &n, 1);
+	done = fence != 0 && gpuWait(fence, 200);
+	IOLockUnlock(gGPULock);
+	if (!done && gBlitSaid++ < 4) {
+		IOLog("RedwoodGPU: a frame onto the panel by the GPU did not finish (submission %u)\n", fence);
+	}
+	return done;
+}
+
+/*
  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
  * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
  */

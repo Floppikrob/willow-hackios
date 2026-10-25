@@ -165,6 +165,14 @@ void            MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t *
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (RedwoodGPU.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+/*
+ * Rows [sy, sy + h) of a surface the GPU drew, from column sx, w wide, copied by the GPU's 2D engine to
+ * (dx, dy) of the panel's memory (physical, rows of `rowBytes`), and waited for; false when it cannot
+ * be (no GPU kept, a surface of a program's own memory, rows the engine cannot address): the caller
+ * copies then (RedwoodGPU.cpp; MiniIOMobileFramebuffer.cpp, fb_gpu=1).
+ */
+bool            RedwoodGPUBlitToPanel(MiniIOSurface * surface, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h,
+    uint32_t dx, uint32_t dy, uint64_t panelPhys, uint32_t rowBytes, uint32_t panelHeight);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
