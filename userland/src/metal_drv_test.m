@@ -53,6 +53,7 @@
 #include <sys/ucontext.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3749,18 +3750,40 @@ enum {
 	/* The panel, not the display. A swap through IOMobileFramebuffer is scaled from the
 	 * 1125x2436 user space sees down to this; kRedwoodShow is not scaled at all -- it is
 	 * a row-by-row copy cut to the panel -- so this is the size to draw. */
-	PANEL_W = 1080, PANEL_H = 2400,
+	PANEL_W = 1080,
 	PIC_TILES = 8,
 	PIC_TILE_W = PANEL_W / PIC_TILES,               /* 135 */
-	PIC_TILE_H = 138,                               /* so eight rows of tiles are 1104, */
-	PIC_MOSAIC_H = PIC_TILES * PIC_TILE_H,          /* and 1104 + 648 + 648 is 2400 */
-	PIC_BAND_H = (PANEL_H - PIC_MOSAIC_H) / 2,      /* exactly: no row of the panel is */
-	PIC_LINEAR_Y = PIC_MOSAIC_H,                    /* left for the processor to fill */
-	PIC_NEAREST_Y = PIC_MOSAIC_H + PIC_BAND_H,
+	PIC_BAND_H = 648,                               /* each band: 1104 + 648 + 648 is redwood's 2400 */
 	PIC_TEX = 8,
 	PIC_SX = PANEL_W / PIC_TEX,                     /* 135, odd */
 	PIC_SY = PIC_BAND_H / PIC_TEX,                  /* 81, odd */
 };
+/*
+ * The panel's height and the mosaic's rows, which differ by phone (pic_panel_size()): redwood's
+ * 1080x2400 takes tiles of 138 rows, 1104 + 648 + 648 = 2400, and no row is left for the processor
+ * to fill; the willow's 1080x2340 takes tiles of 130, 1040 + 648 + 648 = 2336, and its last four
+ * rows stay black. The bands keep their 648 either way: 81 rows a texel, odd, is what puts a pixel
+ * centre on every texel centre and makes the band checks exact.
+ */
+static unsigned pic_panel_h = 2400, pic_tile_h = 138;
+#define PANEL_H         pic_panel_h
+#define PIC_TILE_H      pic_tile_h
+#define PIC_MOSAIC_H    (PIC_TILES * PIC_TILE_H)
+#define PIC_LINEAR_Y    PIC_MOSAIC_H
+#define PIC_NEAREST_Y   (PIC_MOSAIC_H + PIC_BAND_H)
+
+/* The willow's panel when the kernel was booted for it (device=willow, which xnuloader passes). */
+static void
+pic_panel_size(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "device=willow") != NULL) {
+		pic_panel_h = 2340;
+		pic_tile_h = 130;
+	}
+}
 
 /* Eight levels of a channel, each an exact byte. A texel written as k/255 comes back as
  * exactly k through an 8-bit unorm attachment, so no check here needs a tolerance and a
@@ -4855,6 +4878,7 @@ picture_path(id<MTLDevice> dev, const char *metallib, int seconds)
 		printf("drvtest: picture: newLibraryWithData: gave nil\n");
 		return;
 	}
+	pic_panel_size();
 	pic_panel = calloc(1, (size_t)PANEL_W * PANEL_H * 4);
 	if (pic_panel == NULL) {
 		printf("drvtest: picture: no memory for %ux%u pixels\n", PANEL_W, PANEL_H);

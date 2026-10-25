@@ -1,0 +1,32 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.metal.willow), on the willow.
+#
+# The Metal driver of this port (src/redwoodmetal.m, built for redwood's Adreno 642L) on the willow's
+# Adreno 610, for the first time. Nothing in it names the GPU: the compiler library
+# (tools/mesa/air/air_metal.c) opens freedreno through the same RedwoodGPU client Mesa's OpenGL ES
+# does, and freedreno takes the model from the kernel's CHIP_ID. The window server draws with the same
+# GPU meanwhile (gpu=1, GL=1).
+#
+# The wait is cpu_test's and not rwtouch's: on the willow rwtouch did not come back from opening
+# /dev/redwood-touch (rc.jobs.gltest.willow). By then SpringBoard is up and the GPU is the window
+# server's as well.
+/redwood/bin/cpu_test 40
+#
+# 1. Does the driver load, is it taken by Metal (steps 4 and 5, MTLAddDevice,
+#    MTLCreateSystemDefaultDevice), and how many of AV1SW.metallib's functions compile for the A610.
+/redwood/bin/metal_drv_test
+#
+# 2. The kernels that bind only buffers and are known to end (rc.jobs.metalcompute): each its own
+#    process, so a crash costs one line.
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_InitMinMax
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_CalcCubeInputScaling
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_InitSpanTable
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib MetalFaceMask_PropogateAssociations
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_bistochastize_init
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_pcg_iter2
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib fbs_pcg_iter3
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib image_calcminmax0
+/redwood/bin/metal_drv_test /System/Library/CoreImage/PortraitFilters.cifilter/default.metallib image_calcminmax2
+#
+# 3. One triangle with one of Apple's own fragment shaders (clearFragment20), whose pixels have a
+#    reference from softpipe (rc.jobs.metaldraw).
+/redwood/bin/metal_drv_test --draw /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib

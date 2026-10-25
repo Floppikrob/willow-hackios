@@ -1056,6 +1056,66 @@ control_center_fades(const char *arguments)
  */
 #define REDWOOD_TWEAK_LOADER    "/redwood/lib/libredwood-tweaks.dylib"
 
+/*
+ * The status bar's layout (boot-arg sb_statusbar). This phone's screen is 1080 x 2340 at scale 3,
+ * 360 x 780 points, which no iPhone is: none of UIKit's _UIStatusBarVisualProvider classes takes it,
+ * and UIKit draws _UIStatusBarVisualProvider_Fallback, a red bar that says "rdar:45025538" (UIKitCore:
+ * "No status bar visual provider for screen ... Please see rdar://45025538."). UIKit has its own
+ * override, a preference that names the class ("WARNING: Using overridden status bar visual provider
+ * class: %@", next to the key): set here in the global domain of the user SpringBoard runs as, it
+ * reaches SpringBoard and every program started after it; /var is made anew each boot, so it is set
+ * each boot. (Wrapping +visualProviderSubclassForScreen:visualProviderInfo: of the providers showed
+ * that nothing here asks it.)
+ *   sb_statusbar=1      _Split1080, the iPhone 12 mini's (1080 pixels wide, 375 points)
+ *   sb_statusbar=NAME   _UIStatusBarVisualProvider_NAME (Split1125, Split828, Split, Phone, ...)
+ *   sb_statusbar=0, or none: UIKit's own choice, the red bar
+ */
+static void
+status_bar_layout(void)
+{
+	char args[1024] = "", name[96] = "_UIStatusBarVisualProvider_";
+	size_t size = sizeof(args) - 1, prefix = strlen(name), length;
+	const char *value;
+	CFStringRef key = CFSTR("UIStatusBarVisualProviderClassName"), wanted;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (value = strstr(args, "sb_statusbar=")) == NULL) {
+		return;
+	}
+	value += strlen("sb_statusbar=");
+	length = strcspn(value, " ");
+	if (length == 0 || (length == 1 && value[0] == '0')) {
+		return;
+	}
+	if (length == 1 && value[0] == '1') {
+		value = "Split1080";
+		length = strlen(value);
+	}
+	if (length >= sizeof(name) - prefix) {
+		return;
+	}
+	memcpy(name + prefix, value, length);
+	name[prefix + length] = 0;
+	if (objc_getClass(name) == Nil) {
+		say("redwood: status bar: sb_statusbar names %s, which UIKit does not have; left as it is\n", name);
+		return;
+	}
+	wanted = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	CFPreferencesSetValue(key, wanted, kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	CFRelease(wanted);
+
+	CFPropertyListRef now = CFPreferencesCopyAppValue(key, CFSTR("com.apple.springboard"));
+	char reads[96] = "nothing";
+
+	if (now != NULL && CFGetTypeID(now) == CFStringGetTypeID()) {
+		CFStringGetCString((CFStringRef)now, reads, sizeof(reads), kCFStringEncodingUTF8);
+	}
+	if (now != NULL) {
+		CFRelease(now);
+	}
+	say("redwood: status bar: the global preference UIStatusBarVisualProviderClassName now reads %s for SpringBoard\n", reads);
+}
+
 static void
 load_tweaks(void)
 {
@@ -1125,6 +1185,7 @@ redwood_springboard_init(void)
 	 */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	status_bar_layout();
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	_dyld_register_func_for_add_image(image_added);         /* Siri's orb, whose framework comes late */
 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",

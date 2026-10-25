@@ -1,0 +1,17 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.metalpicture.willow), on the willow.
+#
+# rc.jobs.metalpicture at the willow's panel: 64 of Apple's clearFragment shaders in an 8x8 mosaic and
+# Apple's textured blit in two bands, every pixel computed by this port's Metal driver on the Adreno 610
+# and copied to the panel by the kernel (kRedwoodShow). metal_drv_test takes the panel's size from
+# device=willow: 1080x2340, tiles of 135x130 (1040 rows), the two bands 648 each as on redwood, the
+# last four rows black. See rc.jobs.metalpicture for what each line of the log means.
+#
+# Build with JOBS="" WIFID=0 GL=1: no daemon of Apple's, so the home screen does not draw over the
+# picture, and GL=1 for /redwood/lib/libredwoodair.dylib. The waits are cpu_test's, not rwtouch's:
+# on the willow rwtouch does not come back from opening /dev/redwood-touch.
+#
+# 1. The canary: clearFragment20 into a 4x4 attachment, whose pixels have softpipe's reference.
+/redwood/bin/metal_drv_test --draw /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib
+#
+# 2. The picture, repainted for 90 seconds: the mosaic first, then the ladder, then the two bands.
+/redwood/bin/metal_drv_test --picture 90 /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib
