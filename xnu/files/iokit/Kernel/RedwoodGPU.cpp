@@ -267,11 +267,36 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	return false;
 }
 
+/*
+ * A surface whose frame eagl.c has announced (a lock of kSurfaceLockGPUWrote, before the frame is
+ * flushed) is waited for until a submission naming it has come -- Mesa's driver thread may flush it
+ * after the window server has already handed the surface to the display (eagl.c glasync=1). At most
+ * this long; then it is shown as it is, and counted.
+ */
+#define SWAP_ANNOUNCED_MS       50
+static struct {
+	uint32_t waited, late;                  /* surfaces waited for so, and of them those still not delivered */
+	uint64_t waiting;
+} gAnnounced;
+
 bool
 MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 {
-	uint32_t fence = surface->drawn;
+	uint32_t fence;
 	bool done = true;
+
+	if (surface->delivered != surface->announced) {
+		uint64_t began = mach_absolute_time(), patience;
+
+		nanoseconds_to_absolutetime(SWAP_ANNOUNCED_MS * NSEC_PER_MSEC, &patience);
+		while (surface->delivered != surface->announced && mach_absolute_time() - began < patience) {
+			delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		}
+		gAnnounced.waited++;
+		gAnnounced.late += surface->delivered != surface->announced;
+		gAnnounced.waiting += mach_absolute_time() - began;
+	}
+	fence = surface->drawn;
 
 	if (fence != 0 && gGPULock != NULL) {
 		IOLockLock(gGPULock);
@@ -1313,6 +1338,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 			b->fence = request->fence;
 			if (b->surface != NULL) {
 				b->surface->drawn = request->fence;
+				b->surface->delivered = b->surface->announced;  /* (what was promised is in this one) */
 			}
 		}
 	}
@@ -1346,6 +1372,14 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		uint64_t prepWaiting;
 
 		redwood_osm_report();           /* (bsd/dev/redwood_a610.c: the Gold cores come up late) */
+		if (gAnnounced.waited != 0) {
+			uint64_t announcedWait;
+
+			absolutetime_to_nanoseconds(gAnnounced.waiting, &announcedWait);
+			IOLog("RedwoodGPU: the display waited for %u announced frames' submissions, %llu us each; %u not there after %u ms\n",
+			    gAnnounced.waited, announcedWait / NSEC_PER_USEC / gAnnounced.waited, gAnnounced.late, SWAP_ANNOUNCED_MS);
+			bzero(&gAnnounced, sizeof(gAnnounced));
+		}
 		absolutetime_to_nanoseconds(gGPUStat.prepWaiting, &prepWaiting);
 		IOLog("RedwoodGPU: cpu-prep: %u asked, %u waited for the GPU, %llu us each\n", gGPUStat.preps, gGPUStat.prepsWaited,
 		    gGPUStat.prepsWaited ? prepWaiting / NSEC_PER_USEC / gGPUStat.prepsWaited : 0);

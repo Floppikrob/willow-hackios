@@ -46,6 +46,8 @@ void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
+int redwood_ufs_read_named(const char *name, uint64_t offset, void *dst, uint64_t len, uint64_t *size); /* a partition's bytes by its name */
+void redwood_mss_init(void);             /* mss_step=N: the modem, which runs the Wi-Fi's firmware (willow) */
 void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
@@ -81,6 +83,8 @@ enum { REDWOOD_STATUS_SCREEN, REDWOOD_STATUS_CPU, REDWOOD_STATUS_MEMORY, REDWOOD
 void redwood_status(unsigned part, const char *format, ...) __printflike(2, 3);
 bool redwood_status_line(unsigned part, char *line, size_t size);
 void redwood_rpm_init(void);           /* boot-arg rpm=N with device=willow: the RPM's request channel, steps 1 to N */
+void redwood_osm_init(void);           /* boot-arg osm_dump=1 with device=willow: the clusters frequency hardware, read */
+void redwood_usb_init(void);           /* boot-arg usb=N with device=willow: the USB port, steps 1 to N */
 void redwood_a610_init(void);          /* boot-arg a610=N with device=willow: the same for the Note 8T's Adreno 610 */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */

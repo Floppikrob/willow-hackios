@@ -528,6 +528,7 @@ extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
  * window server included.
  */
 void redwood_memory_line(char *buf, size_t len);
+void redwood_fault_report(void);
 
 /* The line itself (also kern.redwood_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
 void
@@ -557,6 +558,7 @@ memory_report(void)
 	redwood_memory_line(line, sizeof(line));
 	printf("%s", line);
 	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
+	redwood_fault_report();                 /* (and the last faults again: bsd/uxkern/ux_exception.c) */
 }
 
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */

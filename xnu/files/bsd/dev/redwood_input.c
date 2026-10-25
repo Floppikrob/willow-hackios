@@ -205,6 +205,8 @@ static const struct cdevsw touch_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
+extern void redwood_hfs_init(void);
+
 void
 redwood_input_init(void)
 {
@@ -221,10 +223,14 @@ redwood_input_init(void)
 	redwood_buttons_init();
 	redwood_battery_init();
 	redwood_ufs_init();
+	redwood_hfs_init();      /* Apple HFS, built in (bsd/hfs/hfs_redwood.c): a filesystem on the flash that writes */
+	redwood_mss_init();      /* mss_step=N: the modem, for the Wi-Fi (bsd/dev/redwood_mss.c) */
 	redwood_net_init();
 	redwood_adreno_init();
 	redwood_rpm_init();
 	redwood_a610_init();
+	redwood_usb_init();
+	redwood_osm_init();
 	redwood_wifi_init();
 	redwood_adsp_init();
 }

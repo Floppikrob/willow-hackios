@@ -61,11 +61,101 @@ index a4d25040f38f..aad72993d139 100644
  kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index 4b83160780c3..09483820bad7 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -77,6 +77,85 @@ COMP_SUBDIRS =
+ 
+ tcp_cubic.o_CWARNFLAGS_ADD += -Wno-error=implicit-int-float-conversion
+ 
++# Apple HFS, built in (bsd/hfs/hfs_redwood.c): its kext prefix header, as core/kext.xcconfig has it, and
++# its warnings left as they are in Apple's own build
++BTree.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTree.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeAllocate.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeAllocate.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeMiscOps.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeMiscOps.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeNodeOps.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeNodeOps.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeNodeReserve.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeNodeReserve.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeScanner.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeScanner.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeTreeOps.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeTreeOps.o_CWARNFLAGS_ADD += -Wno-error -w
++BTreeWrapper.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++BTreeWrapper.o_CWARNFLAGS_ADD += -Wno-error -w
++CatalogUtilities.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++CatalogUtilities.o_CWARNFLAGS_ADD += -Wno-error -w
++FileExtentMapping.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++FileExtentMapping.o_CWARNFLAGS_ADD += -Wno-error -w
++FileIDsServices.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++FileIDsServices.o_CWARNFLAGS_ADD += -Wno-error -w
++MacOSStubs.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++MacOSStubs.o_CWARNFLAGS_ADD += -Wno-error -w
++UnicodeWrappers.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++UnicodeWrappers.o_CWARNFLAGS_ADD += -Wno-error -w
++VolumeAllocation.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++VolumeAllocation.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_attrlist.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_attrlist.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_btreeio.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_btreeio.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_catalog.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_catalog.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_chash.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_chash.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_cnode.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_cnode.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_cprotect.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_cprotect.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_endian.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_endian.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_extents.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_extents.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_fsinfo.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_fsinfo.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_hotfiles.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_hotfiles.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_journal.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_journal.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_link.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_link.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_lookup.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_lookup.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_notification.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_notification.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_quota.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_quota.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_readwrite.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_readwrite.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_redwood.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_redwood.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_resize.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_resize.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_search.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_search.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_vfsops.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_vfsops.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_vfsutils.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_vfsutils.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_vnops.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_vnops.o_CWARNFLAGS_ADD += -Wno-error -w
++hfs_xattr.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++hfs_xattr.o_CWARNFLAGS_ADD += -Wno-error -w
++rangelist.o_CFLAGS_ADD += -include $(SRCROOT)/bsd/hfs/kext-config.h
++rangelist.o_CWARNFLAGS_ADD += -Wno-error -w
++
+ #
+ # Diagnostic opt-outs.  We need to make this list empty.
+ #
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..c886820a9628 100644
+index 44274016a4cf..67afe8f166ec 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,41 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,83 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -76,10 +166,52 @@ index 44274016a4cf..c886820a9628 100644
 +bsd/dev/redwood_a610.c		standard
 +bsd/dev/redwood_status.c	standard
 +bsd/dev/redwood_rpm.c		standard
++bsd/dev/redwood_usb.c		standard
++bsd/dev/redwood_osm.c		standard
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_ufs.c	standard
++bsd/dev/redwood_mss.c	standard
 +bsd/dev/redwood_ufshc.c	standard
++# Apple HFS (hfs-627.100.6 core/), built in: bsd/hfs/hfs_redwood.c
++bsd/hfs/BTree.c		standard
++bsd/hfs/BTreeAllocate.c		standard
++bsd/hfs/BTreeMiscOps.c		standard
++bsd/hfs/BTreeNodeOps.c		standard
++bsd/hfs/BTreeNodeReserve.c		standard
++bsd/hfs/BTreeScanner.c		standard
++bsd/hfs/BTreeTreeOps.c		standard
++bsd/hfs/BTreeWrapper.c		standard
++bsd/hfs/CatalogUtilities.c		standard
++bsd/hfs/FileExtentMapping.c		standard
++bsd/hfs/FileIDsServices.c		standard
++bsd/hfs/MacOSStubs.c		standard
++bsd/hfs/UnicodeWrappers.c		standard
++bsd/hfs/VolumeAllocation.c		standard
++bsd/hfs/hfs_attrlist.c		standard
++bsd/hfs/hfs_btreeio.c		standard
++bsd/hfs/hfs_catalog.c		standard
++bsd/hfs/hfs_chash.c		standard
++bsd/hfs/hfs_cnode.c		standard
++bsd/hfs/hfs_cprotect.c		standard
++bsd/hfs/hfs_endian.c		standard
++bsd/hfs/hfs_extents.c		standard
++bsd/hfs/hfs_fsinfo.c		standard
++bsd/hfs/hfs_hotfiles.c		standard
++bsd/hfs/hfs_journal.c		standard
++bsd/hfs/hfs_link.c		standard
++bsd/hfs/hfs_lookup.c		standard
++bsd/hfs/hfs_notification.c		standard
++bsd/hfs/hfs_quota.c		standard
++bsd/hfs/hfs_readwrite.c		standard
++bsd/hfs/hfs_redwood.c		standard
++bsd/hfs/hfs_resize.c		standard
++bsd/hfs/hfs_search.c		standard
++bsd/hfs/hfs_vfsops.c		standard
++bsd/hfs/hfs_vfsutils.c		standard
++bsd/hfs/hfs_vnops.c		standard
++bsd/hfs/hfs_xattr.c		standard
++bsd/hfs/rangelist.c		standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_virtio_net.c	standard
 +bsd/dev/redwood_apple80211.c	standard
@@ -107,7 +239,7 @@ index 44274016a4cf..c886820a9628 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +190,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +232,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -122,7 +254,7 @@ index 44274016a4cf..c886820a9628 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +404,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +446,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -130,7 +262,7 @@ index 44274016a4cf..c886820a9628 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +427,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +469,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1096,6 +1228,150 @@ index 74a2036cf69e..a68b79ce48fa 100644
  
  #define UIO_IS_USER_SPACE32( a_uio_t )  \
  	( (a_uio_t)->uio_segflg == UIO_USERSPACE32 || (a_uio_t)->uio_segflg == UIO_PHYS_USERSPACE32 || \
+diff --git a/bsd/uxkern/ux_exception.c b/bsd/uxkern/ux_exception.c
+index 1780c2a20b36..aafb522998ce 100644
+--- a/bsd/uxkern/ux_exception.c
++++ b/bsd/uxkern/ux_exception.c
+@@ -107,6 +107,128 @@ ux_exception(int                        exception,
+ 	return 0;
+ }
+ 
++/*
++ * This port: a line for a fault that kills (SIGBUS, SIGSEGV, SIGILL) -- what process, what exception,
++ * where, and which file is mapped there. No crash reporter runs on this port, so nothing else says.
++ */
++#include <sys/bsdtask_info.h>
++#include <sys/vnode.h>
++#include <mach/thread_status.h>
++#if defined(__arm64__)
++extern struct arm_saved_state *find_user_regs(thread_t);
++#endif
++
++/* Where user address addr is: the file mapped there and the offset in it, into buf. */
++static void
++ux_where(proc_t p, uint64_t addr, char *buf, size_t size)
++{
++	struct proc_regioninfo_internal info;
++	uintptr_t vnodeaddr = 0;
++	uint32_t vid = 0;
++	char path[200] = "";
++	int length = sizeof(path);
++
++	bzero(&info, sizeof(info));
++	if (fill_procregioninfo(proc_task(p), addr, &info, &vnodeaddr, &vid) == 0) {
++		snprintf(buf, size, "%#llx (unmapped)", addr);
++		return;
++	}
++	if (vnodeaddr != 0 && vnode_getwithvid((vnode_t)vnodeaddr, vid) == 0) {
++		if (vn_getpath((vnode_t)vnodeaddr, path, &length) != 0) {
++			path[0] = 0;
++		}
++		vnode_put((vnode_t)vnodeaddr);
++	}
++	snprintf(buf, size, "%#llx (%s +%#llx, tag %u)", addr, path[0] ? path : "anonymous",
++	    addr - info.pri_address + info.pri_offset, info.pri_user_tag);
++}
++
++/* The last faults' lines, said again every minute (redwood_fault_report(), from loader_return.c's memory line) */
++#define UX_KEPT 4
++static char ux_kept[UX_KEPT][1200];
++static unsigned ux_kept_next;
++
++void redwood_fault_report(void);
++void
++redwood_fault_report(void)
++{
++	for (unsigned i = 0; i < UX_KEPT; i++) {
++		if (ux_kept[i][0] != 0) {
++			printf("fault (kept): %s", ux_kept[i]);
++		}
++	}
++}
++
++static void
++ux_exception_say(proc_t p, thread_t thread, int ux_signal, int exception, mach_exception_code_t code,
++    mach_exception_subcode_t subcode)
++{
++	struct proc_regioninfo_internal info;
++	uintptr_t vnodeaddr = 0;
++	uint32_t vid = 0;
++	char path[256] = "";
++	int length = sizeof(path);
++
++	bzero(&info, sizeof(info));
++	if (exception == EXC_BAD_ACCESS && fill_procregioninfo(proc_task(p), (uint64_t)subcode, &info, &vnodeaddr, &vid) != 0 &&
++	    vnodeaddr != 0) {
++		vnode_t vp = (vnode_t)vnodeaddr;
++
++		if (vnode_getwithvid(vp, vid) == 0) {
++			if (vn_getpath(vp, path, &length) != 0) {
++				strlcpy(path, "(no path)", sizeof(path));
++			}
++			vnode_put(vp);
++		}
++	}
++	uthread_t ut = get_bsdthread_info(thread);
++	char name[64] = "";
++
++	if (ut != NULL && ut->pth_name != NULL) {
++		strlcpy(name, ut->pth_name, sizeof(name));
++	}
++	char *kept = ux_kept[ux_kept_next++ % UX_KEPT];
++	size_t n;
++
++	n = (size_t)snprintf(kept, sizeof(ux_kept[0]), "%s[%d] thread %llu '%s' signal %d: exception %d code %#llx address %#llx; "
++	    "region %#llx..%#llx prot %x tag %u offset %#llx %s", proc_best_name(p), proc_pid(p), thread_tid(thread), name,
++	    ux_signal, exception, (uint64_t)code, (uint64_t)subcode, info.pri_address, info.pri_address + info.pri_size,
++	    info.pri_protection, info.pri_user_tag, info.pri_offset, path[0] ? path : "(anonymous or none)");
++	if (exception == EXC_BAD_ACCESS && info.pri_size != 0) {
++		/* the neighbours: a guard page (prot 0) says whose stack (tag 30) it guards, and how big that is */
++		struct proc_regioninfo_internal next;
++		uint64_t at[2] = { info.pri_address + info.pri_size, info.pri_address - 1 };
++
++		for (int i = 0; i < 2; i++) {
++			bzero(&next, sizeof(next));
++			if (fill_procregioninfo(proc_task(p), at[i], &next, NULL, NULL) != 0 && n < sizeof(ux_kept[0])) {
++				n += (size_t)snprintf(kept + n, sizeof(ux_kept[0]) - n, "; %s %#llx..%#llx (%llu KB) prot %x tag %u",
++				    i ? "below" : "above", next.pri_address, next.pri_address + next.pri_size, next.pri_size >> 10,
++				    next.pri_protection, next.pri_user_tag);
++			}
++		}
++	}
++#if defined(__arm64__)
++	{
++		struct arm_saved_state *regs = find_user_regs(thread);
++		char pcs[260], lrs[260];
++
++		if (regs != NULL && n < sizeof(ux_kept[0])) {
++			ux_where(p, get_saved_state_pc(regs), pcs, sizeof(pcs));
++			ux_where(p, get_saved_state_lr(regs), lrs, sizeof(lrs));
++			n += (size_t)snprintf(kept + n, sizeof(ux_kept[0]) - n, "; pc %s; lr %s", pcs, lrs);
++		}
++	}
++#endif
++	if (n < sizeof(ux_kept[0]) - 1) {
++		kept[n] = '\n';
++		kept[n + 1] = 0;
++	} else {
++		kept[sizeof(ux_kept[0]) - 2] = '\n';
++	}
++	printf("fault: %s", kept);
++}
++
+ /*
+  * Sends the corresponding UNIX signal to a thread that has triggered a Mach exception.
+  */
+@@ -172,6 +294,10 @@ handle_ux_exception(thread_t                    thread,
+ 		}
+ 	}
+ 
++	if (ux_signal == SIGBUS || ux_signal == SIGSEGV || ux_signal == SIGILL) {
++		ux_exception_say(p, thread, ux_signal, exception, code, subcode);
++	}
++
+ 	/* Send signal to thread */
+ 	if (ux_signal != 0) {
+ 		ut->uu_exception = exception;
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
 index cbaa0b221894..78315a2d54cf 100644
 --- a/bsd/vfs/vfs_attrlist.c

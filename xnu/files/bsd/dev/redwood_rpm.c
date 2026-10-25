@@ -29,6 +29,7 @@
  * the phone's device tree (memory@045F0000 "qcom,rpm-msg-ram", mailbox@0F111000, rpm-glink).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -78,6 +79,8 @@ wr(vm_offset_t address, uint32_t value)
 #define RX_FIFO_ID              0x72326170      /* "r2ap": from the RPM to us */
 
 static vm_offset_t msg_ram, ipc;
+static LCK_GRP_DECLARE(rpm_lck_grp, "redwood-rpm");
+static LCK_MTX_DECLARE(rpm_lock, &rpm_lck_grp);     /* one request and its answer at a time */
 
 #define IPC_PHYS                0x0f111000UL
 #define IPC_DOORBELL            8               /* bit 0: the RPM */
@@ -252,6 +255,22 @@ fifo_take(void)
 	return true;
 }
 
+/* A request into the FIFO, the RPM rung, its answer taken: under the lock. */
+static bool
+rpm_send(const uint32_t *words, uint32_t count)
+{
+	bool answered = false;
+
+	lck_mtx_lock(&rpm_lock);
+	if (fifo_put(words, count)) {
+		wr(ipc + IPC_DOORBELL, 1);
+		__builtin_arm_dsb(0xf);
+		answered = fifo_take();
+	}
+	lck_mtx_unlock(&rpm_lock);
+	return answered;
+}
+
 /* One key-value request for a resource of the RPM, active set; its answer said. */
 static bool
 rpm_ask_key(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value, const char *unit)
@@ -274,12 +293,7 @@ rpm_ask_key(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t
 	m[12] = 4;
 	m[13] = value;
 	printf("rpm: next: ask for %s at %u %s (message %#x)\n", what, value, unit, m[6]);
-	if (!fifo_put(m, sizeof(m))) {
-		return false;
-	}
-	wr(ipc + IPC_DOORBELL, 1);
-	__builtin_arm_dsb(0xf);
-	return fifo_take();
+	return rpm_send(m, sizeof(m));
 }
 
 static bool
@@ -296,6 +310,51 @@ rpm_ask(const char *what, uint32_t type, uint32_t id, uint32_t khz)
  * below what another processor wants. False if the channel is not there (rpm= under 2) or the
  * RPM refuses.
  */
+/*
+ * An LDO of the PMIC on, at so many microvolts, as UEFI asked for ldoa 7 and 10 (step 1 reads it
+ * back out of the FIFO): one request of three key-values, "uv" the voltage, "lsmd" 7 the high-power
+ * mode, "swen" 1 on. For redwood_usb.c: the USB PHY's 3.3 V (ldoa 15).
+ */
+#define TYPE_LDO_A              0x616f646c      /* "ldoa" */
+#define KEY_MICROVOLT           0x00007675      /* "uv" */
+#define KEY_LDO_MODE            0x646d736c      /* "lsmd" */
+#define KEY_SWITCH_ENABLE       0x6e657773      /* "swen" */
+#define LDO_MODE_HIGH_POWER     7
+
+bool
+redwood_rpm_ldo(const char *what, uint32_t id, uint32_t microvolts)
+{
+	static uint32_t msg_id = 0x7800;
+	uint32_t m[20];
+
+	if (!tx.found || !rx.found || ipc == 0) {
+		printf("rpm: no channel to the RPM for %s (rpm=2 or more is needed)\n", what);
+		return false;
+	}
+	m[0] = GLINK_CMD_TX_DATA | UEFI_CHANNEL << 16;
+	m[1] = 0;
+	m[2] = 28 + 3 * 12;                     /* this chunk */
+	m[3] = 0;
+	m[4] = RPM_REQUEST;
+	m[5] = 20 + 3 * 12;
+	m[6] = msg_id++;
+	m[7] = RPM_ACTIVE_STATE;
+	m[8] = TYPE_LDO_A;
+	m[9] = id;
+	m[10] = 3 * 12;
+	m[11] = KEY_MICROVOLT;
+	m[12] = 4;
+	m[13] = microvolts;
+	m[14] = KEY_LDO_MODE;
+	m[15] = 4;
+	m[16] = LDO_MODE_HIGH_POWER;
+	m[17] = KEY_SWITCH_ENABLE;
+	m[18] = 4;
+	m[19] = 1;
+	printf("rpm: next: ask for %s: ldoa %u on at %u uV (message %#x)\n", what, id, microvolts, m[6]);
+	return rpm_send(m, sizeof(m));
+}
+
 bool
 redwood_rpm_level(const char *what, bool mx, uint32_t level)
 {
@@ -376,9 +435,15 @@ redwood_rpm_init(void)
 	if (!PE_parse_boot_argn("rpm", &steps, sizeof(steps))) {
 		uint32_t gpu = 0, a610 = 0;
 
+		uint32_t usb = 0;
+
 		/* gpu=1 (without a610=): the GPU's start (redwood_a610.c) wants the buses, so all three steps */
 		if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu && !PE_parse_boot_argn("a610", &a610, sizeof(a610))) {
 			steps = 3;
+		}
+		/* usb=2 or more: the USB PHY's supply (redwood_usb.c) is the RPM's, and the channel is step 2's */
+		if (steps == 0 && PE_parse_boot_argn("usb", &usb, sizeof(usb)) && usb >= 2) {
+			steps = 2;
 		}
 	}
 	if (steps == 0) {

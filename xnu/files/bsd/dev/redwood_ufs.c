@@ -14,7 +14,7 @@
  *
  * Read only wherever a write could do harm, by construction. The block devices never write: the
  * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
- * writing is refused. With ufs_write=1 one character device alone takes writes -- the store,
+ * writing is refused -- but for the data store below. With ufs_write=1 one character device alone takes writes -- the store,
  * /dev/rufs_darwin on redwood and /dev/rufs_system on willow (ufs_stores below) -- and in it only
  * whole blocks from UFS_WRITE_FIRST on, past the iOS
  * volume and both cryptexes that the build writes from the computer (tools/darwin-write.py); that
@@ -82,10 +82,19 @@ static const struct ufs_store {
 	const char *name;
 	uint64_t first_lba, blocks;     /* where it begins on the unit and how long, as the GPT has it */
 	uint32_t block_size;
+	uint64_t write_first;           /* from which of its blocks of 4096 a write may go */
+	bool filesystem;                /* the data store (ufs_write=data): a filesystem's, block device and all */
 } ufs_stores[] = {
-	{ "darwin", 25374720, 5242875, 4096 },          /* redwood: the port's own 20 GiB at the end of unit 0 */
-	{ "system", 10059776, 20971520, 512 },          /* willow: Android's 10 GiB of the eMMC, mmcblk0p86 */
+	{ "darwin", 25374720, 5242875, 4096, UFS_WRITE_FIRST, false },  /* redwood: the port's own 20 GiB at the end of unit 0 */
+	{ "system", 10059776, 20971520, 512, UFS_WRITE_FIRST, false },  /* willow: Android's 10 GiB of the eMMC, mmcblk0p86 */
+	/*
+	 * willow: userdata, mmcblk0p87, the 43 GiB that were Android's data (wiped for this): the
+	 * filesystem iOS's data lives in. Its block device writes, so it can be mounted for writing.
+	 */
+	{ "userdata", 31031296, 91111391, 512, 0, true },
 };
+static uint64_t ufs_write_first = UFS_WRITE_FIRST;      /* the store's of this run, in blocks of 4096 */
+static bool ufs_write_fs;                               /* the store of this run is the data store */
 
 struct loader_block_part {
 	char name[36];
@@ -305,6 +314,44 @@ SYSCTL_PROC(_kern_redwood, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
     ufs_sysctl_var_busy, "I", "the claim a writer of the store must hold: 1 takes it, 0 gives it back");
 
 /*
+ * What the storage cost over the last ten seconds of use (ufs_window_note(), a line when they are up):
+ * [0] reads, [1] writes -- requests, bytes, the loader's answer time in all and the longest; and the
+ * time reads waited for the mailbox itself, behind whatever request held it (a write of /var, say,
+ * while a program's page of code was wanted).
+ */
+static struct {
+	uint64_t since;
+	uint64_t requests[2], bytes[2], answer_us[2], longest_us[2];
+	uint64_t lock_waits, lock_wait_us, lock_longest_us;
+} ufs_window;
+
+static void
+ufs_window_note(uint32_t op, uint64_t bytes, uint64_t us)
+{
+	uint32_t k = op == BLOCK_OP_WRITE;
+	uint64_t now = mach_absolute_time(), ns;
+
+	if (ufs_window.since == 0) {
+		ufs_window.since = now;
+	}
+	ufs_window.requests[k]++;
+	ufs_window.bytes[k] += bytes;
+	ufs_window.answer_us[k] += us;
+	ufs_window.longest_us[k] = us > ufs_window.longest_us[k] ? us : ufs_window.longest_us[k];
+	absolutetime_to_nanoseconds(now - ufs_window.since, &ns);
+	if (ns >= 10 * NSEC_PER_SEC) {
+		printf("ufs: %llu s: reads %llu (%llu KB), answered in %llu us each, %llu at most; writes %llu (%llu KB), %llu us "
+		    "each, %llu at most; reads waited for the mailbox %llu times, %llu ms in all, %llu ms at most\n",
+		    ns / NSEC_PER_SEC, ufs_window.requests[0], ufs_window.bytes[0] >> 10,
+		    ufs_window.requests[0] ? ufs_window.answer_us[0] / ufs_window.requests[0] : 0, ufs_window.longest_us[0],
+		    ufs_window.requests[1], ufs_window.bytes[1] >> 10,
+		    ufs_window.requests[1] ? ufs_window.answer_us[1] / ufs_window.requests[1] : 0, ufs_window.longest_us[1],
+		    ufs_window.lock_waits, ufs_window.lock_wait_us / 1000, ufs_window.lock_longest_us / 1000);
+		bzero(&ufs_window, sizeof(ufs_window));
+	}
+}
+
+/*
  * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
  * read into dst, or, with src, written from there. Called with ufs_lock held.
  */
@@ -369,6 +416,7 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 
 		absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
 		ufs_wait_us += ns / 1000;
+		ufs_window_note(op, bytes, ns / 1000);
 	}
 	status = ufs_page->answer.status;
 	if (status != 0) {
@@ -415,6 +463,39 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 }
 
 /* One of this driver's devices (block or character): a request to it costs tens of microseconds */
+/*
+ * Bytes [offset, offset + len) of the partition with that GPT name, for another driver of this
+ * kernel (bsd/dev/redwood_mss.c: the modem's firmware, out of the FAT partition "modem"): 0, or an
+ * errno -- ENXIO when the storage is not up or there is no such partition.
+ */
+static int ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len);
+static uint64_t ufs_part_bytes(uint32_t part);
+
+int
+redwood_ufs_read_named(const char *name, uint64_t offset, void *dst, uint64_t len, uint64_t *size)
+{
+	if (!ufs_ready) {
+		return ENXIO;
+	}
+	for (uint32_t i = 0; i < ufs_parts; i++) {
+		if (!(ufs_page->part[i].flags & BLOCK_PART_UNIT) && strncmp((const char *)ufs_page->part[i].name, name, 36) == 0) {
+			uint64_t bytes = ufs_part_bytes(i);
+
+			if (size != NULL) {
+				*size = bytes;
+			}
+			if (len == 0) {
+				return 0;
+			}
+			if (offset > bytes || len > bytes - offset) {
+				return EINVAL;
+			}
+			return ufs_read(i, offset, (uint8_t *)dst, len);
+		}
+	}
+	return ENXIO;
+}
+
 bool
 redwood_ufs_dev(dev_t dev)
 {
@@ -471,7 +552,17 @@ ufs_read_mailbox(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 			return ENOMEM;
 		}
 	}
-	lck_mtx_lock(&ufs_lock);
+	{
+		uint64_t asked = mach_absolute_time(), ns;
+
+		lck_mtx_lock(&ufs_lock);
+		absolutetime_to_nanoseconds(mach_absolute_time() - asked, &ns);
+		if (ns >= 50 * NSEC_PER_USEC) {        /* (a free mailbox is taken in well under that) */
+			ufs_window.lock_waits++;
+			ufs_window.lock_wait_us += ns / 1000;
+			ufs_window.lock_longest_us = ns / 1000 > ufs_window.lock_longest_us ? ns / 1000 : ufs_window.lock_longest_us;
+		}
+	}
 	if (ufshc_list_in()) {
 		/* this kernel's own transfer list is in the controller: UEFI's driver must not be asked to ring */
 		if (ufs_mailbox_refused++ < 4) {
@@ -589,7 +680,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset < UFS_WRITE_FIRST * 4096 || offset > ufs_part_bytes(part) ||
+	if (offset < ufs_write_first * 4096 || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -662,8 +753,8 @@ ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 	if (!ufs_ready || (uint32_t)minor(dev) >= ufs_parts || (ufs_page->part[minor(dev)].flags & BLOCK_PART_UNIT)) {
 		return ENXIO;
 	}
-	if (flags & FWRITE) {
-		return EROFS;           /* a block device of this driver never writes */
+	if ((flags & FWRITE) && !(ufs_write_fs && ufs_write_part >= 0 && (uint32_t)minor(dev) == (uint32_t)ufs_write_part)) {
+		return EROFS;           /* a block device of this driver never writes, but the data store's */
 	}
 	return 0;
 }
@@ -708,8 +799,8 @@ ufs_strategy(buf_t bp)
 		buf_biodone(bp);
 		return;
 	}
-	if (!(buf_flags(bp) & B_READ)) {
-		buf_seterror(bp, EROFS);         /* this device never writes */
+	if (!(buf_flags(bp) & B_READ) && !(ufs_write_fs && ufs_write_part >= 0 && part == (uint32_t)ufs_write_part)) {
+		buf_seterror(bp, EROFS);         /* this device never writes, but the data store */
 		buf_biodone(bp);
 		return;
 	}
@@ -725,7 +816,22 @@ ufs_strategy(buf_t bp)
 	if (offset + len > size) {
 		len = size - offset;
 	}
-	error = ufs_read(part, offset, (uint8_t *)buf_dataptr(bp), len);
+	/*
+	 * The data through buf_map: a buffer of the cluster layer is pages of a file's cache (a UPL)
+	 * that need not be mapped in the kernel; buf_map maps them for the length of this, and gives
+	 * a buffer of the buffer cache its own address as it is.
+	 */
+	caddr_t data = NULL;
+
+	error = buf_map(bp, &data);
+	if (error == 0) {
+		if (buf_flags(bp) & B_READ) {
+			error = ufs_read(part, offset, (uint8_t *)data, len);
+		} else {
+			error = ufs_write(part, offset, (const uint8_t *)data, len);
+		}
+		(void)buf_unmap(bp);
+	}
 	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));
 	if (error) {
 		buf_seterror(bp, error);
@@ -765,10 +871,18 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 		*(uint64_t *)data = ufs_part_bytes(part) / ufs_bsize[part];
 		return 0;
 	case DKIOCISWRITABLE:
-		*(uint32_t *)data = 0;  /* the block device, which is what a filesystem would ask */
+		/* the block device, which is what a filesystem would ask: only the data store's */
+		*(uint32_t *)data = ufs_write_fs && ufs_write_part >= 0 && part == (uint32_t)ufs_write_part;
 		return 0;
 	case DKIOCGETMAXBLOCKCOUNTREAD:
+	case DKIOCGETMAXBLOCKCOUNTWRITE:
 		*(uint64_t *)data = ufs_buffer_size / ufs_bsize[part];
+		return 0;
+	case DKIOCSYNCHRONIZE:
+	case DKIOCSYNCHRONIZECACHE:
+		return 0;               /* every write is on the flash, and read back, before it answers */
+	case DKIOCISVIRTUAL:
+		*(uint32_t *)data = 0;
 		return 0;
 	default:
 		return ENOTTY;
@@ -843,7 +957,7 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 	if (!ufs_ready || part >= ufs_parts || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
 		return EROFS;
 	}
-	if (ufs_var_busy_pid != proc_selfpid()) {
+	if (!ufs_write_fs && ufs_var_busy_pid != proc_selfpid()) {
 		/* one writer of the store at a time, and it says so first (kern.redwood.var_busy) */
 		ufs_write_refused++;
 		return EPERM;
@@ -1510,11 +1624,14 @@ redwood_ufs_init(void)
 	 * one of ufs_stores, the partition the port was set up with, in everything the loader's table
 	 * says of it; the loader looks at its GUIDs besides, and refuses the same bounds of its own accord.
 	 */
-	check = 0;
-	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
-		uint32_t offered = ufs_page->write_part_plus_one;
+	char wanted[8] = "";
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+	if (PE_parse_boot_arg_str("ufs_write", wanted, sizeof(wanted)) &&
+	    (strcmp(wanted, "1") == 0 || strcmp(wanted, "data") == 0)) {
+		uint32_t offered = ufs_page->write_part_plus_one;
+		bool fs = strcmp(wanted, "data") == 0;
+
+		if (offered == 0 || offered > ufs_parts) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes)\n");
 		}
@@ -1523,7 +1640,8 @@ redwood_ufs_init(void)
 			const char *why = NULL;
 
 			for (uint32_t k = 0; k < sizeof(ufs_stores) / sizeof(ufs_stores[0]); k++) {
-				if (strncmp((const char *)ufs_page->part[i].name, ufs_stores[k].name, 32) == 0) {
+				if (strncmp((const char *)ufs_page->part[i].name, ufs_stores[k].name, 32) == 0 &&
+				    ufs_stores[k].filesystem == fs) {
 					st = &ufs_stores[k];
 				}
 			}
@@ -1545,19 +1663,25 @@ redwood_ufs_init(void)
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != st->block_size) {
 				why = "its blocks are not the size they were";
+			} else if (ufs_page->write_first != st->write_first) {
+				why = "the loader would take writes from another block of it";
 			}
 			if (why != NULL) {
 				printf("ufs: %s: no write will be asked for: %s\n", st->name, why);
 				continue;
 			}
 			ufs_write_part = (int)i;
+			ufs_write_first = st->write_first;
+			ufs_write_fs = st->filesystem;
 			strlcpy(ufs_store_name, st->name, sizeof(ufs_store_name));
 		}
 		if (ufs_write_part >= 0) {
-			redwood_status(REDWOOD_STATUS_STORAGE, "ok, %u partitions; /var kept in %s", made, ufs_store_name);
-			printf("ufs: /dev/rufs_%s takes writes, whole blocks from byte %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", ufs_store_name, UFS_WRITE_FIRST * 4096,
-			    (ufs_part_bytes((uint32_t)ufs_write_part) - UFS_WRITE_FIRST * 4096) >> 20);
+			redwood_status(REDWOOD_STATUS_STORAGE, ufs_write_fs ? "ok, %u partitions; /var on %s" :
+			    "ok, %u partitions; /var kept in %s", made, ufs_store_name);
+			printf("ufs: %s%s%s/dev/rufs_%s takes writes, whole blocks from byte %llu on (%llu MB of it); "
+			    "everything else of the storage is read only\n", ufs_write_fs ? "/dev/ufs_" : "",
+			    ufs_write_fs ? ufs_store_name : "", ufs_write_fs ? " and " : "", ufs_store_name, ufs_write_first * 4096,
+			    (ufs_part_bytes((uint32_t)ufs_write_part) - ufs_write_first * 4096) >> 20);
 		} else {
 			printf("ufs: nothing takes writes: no store among the partitions\n");
 		}

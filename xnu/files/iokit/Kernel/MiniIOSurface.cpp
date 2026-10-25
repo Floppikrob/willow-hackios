@@ -1759,6 +1759,8 @@ IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t 
 			 */
 			if (options & kSurfaceLockGPUWrote) {
 				ref->surface->gpuBumps++;
+				/* (eagl.c takes it before the frame is flushed: the display waits for the submission) */
+				OSIncrementAtomic((volatile SInt32 *) &ref->surface->announced);
 			}
 			sh->seed++;
 		}

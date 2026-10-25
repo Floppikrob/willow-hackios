@@ -513,6 +513,8 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
+#define BLOCK_WRITE_FIRST  2042368ULL                  /* blocks of 4096: past both cryptexes (see below) */
+
 /*
  * The one partition of a device that a write may reach (ufs_write=1): where the data of iOS lives,
  * past the iOS volume and both cryptexes the build writes from the computer. Every field has to be
@@ -523,6 +525,7 @@ struct store_part {
 	efi_guid type, uniq;             /* its type and unique GUIDs */
 	uint64_t first_lba, last_lba;    /* where it begins and ends on unit 0 */
 	uint32_t block_size;
+	uint64_t write_first;            /* from which of its blocks of 4096 a write may go */
 };
 
 struct platform {
@@ -539,6 +542,7 @@ struct platform {
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
 	const struct store_part *store;  /* the partition a write may reach; NULL: none */
+	const struct store_part *data_store;     /* ... with ufs_write=data instead: a filesystem's, whole */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -558,7 +562,7 @@ static const struct store_part redwood_store = {
 	.name = "darwin",
 	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
 	.uniq = { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } },
-	.first_lba = 25374720, .last_lba = 30617594, .block_size = 4096,
+	.first_lba = 25374720, .last_lba = 30617594, .block_size = 4096, .write_first = BLOCK_WRITE_FIRST,
 };
 
 static const struct platform platform_redwood = {
@@ -590,7 +594,18 @@ static const struct store_part willow_store = {
 	.name = "system",
 	.type = { 0x97d7b011, 0x54da, 0x4835, { 0xb3, 0xc4, 0x91, 0x7a, 0xd6, 0xe7, 0x3d, 0x74 } },
 	.uniq = { 0xf3caeb92, 0xf746, 0xd6d9, { 0x37, 0xf5, 0xb0, 0x63, 0xf7, 0x85, 0x1e, 0x7a } },
-	.first_lba = 10059776, .last_lba = 31031295, .block_size = 512,
+	.first_lba = 10059776, .last_lba = 31031295, .block_size = 512, .write_first = BLOCK_WRITE_FIRST,
+};
+
+/*
+ * userdata (mmcblk0p87), the 43 GiB that were Android's data (wiped for this, 2026-10-25): with
+ * ufs_write=data, a filesystem of iOS's data lives here, so the whole of it may be written.
+ */
+static const struct store_part willow_data_store = {
+	.name = "userdata",
+	.type = { 0x1b81e7e6, 0xf50d, 0x419b, { 0xa7, 0x39, 0x2a, 0xee, 0xf8, 0xda, 0x33, 0x35 } },
+	.uniq = { 0x91e4b97f, 0x59ab, 0x907b, { 0x15, 0xb8, 0x38, 0xf8, 0xe9, 0x04, 0x05, 0x1f } },
+	.first_lba = 31031296, .last_lba = 122142686, .block_size = 512, .write_first = 0,
 };
 
 static const struct platform platform_willow = {
@@ -605,6 +620,7 @@ static const struct platform platform_willow = {
 	.small_cores = 0xf0,
 	.fb_base = 0x5C000000,           /* Mu-Silicium willowPkg: "Display Reserved", 1080 x 2340 */
 	.store = &willow_store,
+	.data_store = &willow_data_store,
 };
 
 /* The slower cores of this run: the platform's, unless willow_osm() has raised the Gold cluster's clock. */
@@ -1599,7 +1615,7 @@ ufs_survey(void)
  * lives there and a write is refused before that block. Counted in blocks of 4096 whatever the
  * partition's own (the shared page says it so); block_write_lba is the same in the partition's.
  */
-#define BLOCK_WRITE_FIRST  2042368ULL                  /* blocks of 4096: past both cryptexes */
+/* (BLOCK_WRITE_FIRST, 2042368 blocks of 4096: past both cryptexes, is defined with struct store_part) */
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1685,7 +1701,8 @@ static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
-static uint64_t block_write_lba;        /* BLOCK_WRITE_FIRST in that partition's blocks */
+static uint64_t block_write_lba;        /* the store's write_first in that partition's blocks */
+static uint64_t block_write_first;      /* ... and in blocks of 4096, for the kernel */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
 /* the bytes of a device path before its end node */
@@ -1940,7 +1957,8 @@ block_tables(void)
 static int
 block_is_store(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	const struct store_part *sp = PLAT->store;
+	/* ufs_write=1: the store; ufs_write=data: the data store, a filesystem's partition */
+	const struct store_part *sp = block_write_requested == 2 ? PLAT->data_store : PLAT->store;
 	const char *why = NULL;
 
 	if (sp == NULL) {
@@ -1970,7 +1988,8 @@ block_is_store(const efi_partition_info *info, const efi_block_io *bio, const st
 		print("ufs: %s: no write will be served: %s\n", sp->name, why);
 		return 0;
 	}
-	block_write_lba = BLOCK_WRITE_FIRST * 4096 / sp->block_size;
+	block_write_lba = sp->write_first * 4096 / sp->block_size;
+	block_write_first = sp->write_first;
 	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
 	    sp->name, info->start_lba, info->end_lba, block_write_lba);
 	return 1;
@@ -2095,7 +2114,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = block_write_first;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -3380,8 +3399,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ufs_requested = c[4] - '0';
 		}
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
-		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[11] == 0 || c[11] == ' ');
+		if (starts_with(c, "ufs_write=") && (c == pi.cmdline || c[-1] == ' ')) {
+			if (c[10] == '1' && (c[11] == 0 || c[11] == ' ')) {
+				block_write_requested = 1;
+			} else if (starts_with(c + 10, "data") && (c[14] == 0 || c[14] == ' ')) {
+				block_write_requested = 2;
+			}
+		}
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
