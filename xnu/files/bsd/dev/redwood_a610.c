@@ -2207,6 +2207,30 @@ out:
 	thread_terminate(current_thread());
 }
 
+extern uint32_t redwood_osm_seen[8][6];        /* osfmk/arm/arm_init.c, osm_ask() */
+extern uint32_t redwood_cpu_mhz[8];             /* ... cpu_speed_probe() (cpuprobe=1) */
+
+/*
+ * What the OSM of each core's cluster read as the core came up (osmc=), and its speed (cpuprobe=1), for
+ * the cores up since the last call: here at the GPU's start, and from RedwoodGPU's 5-second line for the
+ * Gold cores, which come up later (~57 s in).
+ */
+void
+redwood_osm_report(void)
+{
+	static uint8_t said;
+
+	for (int core = 0; core < 8; core++) {
+		const uint32_t *seen = redwood_osm_seen[core];
+
+		if ((said & (1u << core)) == 0 && (seen[5] != 0 || redwood_cpu_mhz[core] != 0)) {
+			said |= (uint8_t)(1u << core);
+			printf("osm: core %d: enable %x then %x, desired %x, cycles %x then %x; %u MHz if one add a cycle\n", core,
+			    seen[0], seen[1], seen[2], seen[3], seen[4], redwood_cpu_mhz[core]);
+		}
+	}
+}
+
 void
 redwood_a610_init(void)
 {
@@ -2217,6 +2241,7 @@ redwood_a610_init(void)
 	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
 		return;
 	}
+	redwood_osm_report();
 	if (!PE_parse_boot_argn("a610", &steps, sizeof(steps))) {
 		if (!(PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu)) {
 			return;

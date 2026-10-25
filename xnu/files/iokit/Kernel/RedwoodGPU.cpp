@@ -64,6 +64,7 @@ uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, 
 extern uint32_t gpu_log;
 bool redwood_gpu_done(uint32_t fence);
 uint32_t redwood_gpu_last(void);
+void redwood_osm_report(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void redwood_gpu_report(const char * why);
 bool redwood_gpu_recover(void);
@@ -224,6 +225,8 @@ static struct {
 	uint64_t flushedSeed, flushedSeen, flushedDue;  /* ... of them: a new seed, mapped by the program, in any case */
 	uint32_t submissions, commands, buffers, surfaces, waits, over;
 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+	uint32_t preps, prepsWaited;            /* MSM_GEM_CPU_PREP asked, and of them those the GPU was not done for */
+	uint64_t prepWaiting;                   /* ... and the time those waited */
 	uint64_t making;                        /* ... and the time it took to make the others */
 } gGPUStat;
 
@@ -1340,6 +1343,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
 		IOLog("RedwoodGPU: out of the cache: %llu MB for a new seed, %llu MB mapped by the program, %llu MB in any case\n",
 		    gGPUStat.flushedSeed >> 20, gGPUStat.flushedSeen >> 20, gGPUStat.flushedDue >> 20);
+		uint64_t prepWaiting;
+
+		redwood_osm_report();           /* (bsd/dev/redwood_a610.c: the Gold cores come up late) */
+		absolutetime_to_nanoseconds(gGPUStat.prepWaiting, &prepWaiting);
+		IOLog("RedwoodGPU: cpu-prep: %u asked, %u waited for the GPU, %llu us each\n", gGPUStat.preps, gGPUStat.prepsWaited,
+		    gGPUStat.prepsWaited ? prepWaiting / NSEC_PER_USEC / gGPUStat.prepsWaited : 0);
 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
@@ -1471,19 +1480,38 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	case kMsmGemInfo:
 		ret = gemInfo(&r.gemInfo);
 		break;
-	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
+	case kMsmGemCpuPrep: {                          /* is the GPU done with a buffer */
+		/*
+		 * With the last submission that names it -- or, for an IOSurface, its pixels, whoever
+		 * submitted that (MiniIOSurface's drawn) -- not with all the GPU has been given: Mesa
+		 * asks this for every IOSurface it maps, and the queue behind may be another frame's.
+		 * A buffer that is not there (given back): everything, as before. Fences only grow.
+		 */
+		uint32_t fence;
+
 		waitBegan = mach_absolute_time();
 		IOLockLock(gGPULock);
+		b = buffer(r.cpuPrep.handle);
+		fence = b == NULL ? redwood_gpu_last() : b->fence;
+		if (b != NULL && b->surface != NULL && b->surface->drawn != 0 && (fence == 0 || (int32_t)(b->surface->drawn - fence) > 0)) {
+			fence = b->surface->drawn;
+		}
 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
-		if (!gpuWait(redwood_gpu_last(), patience)) {
-			ret = kIOReturnBusy;
-			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
-				waitOver(&r.cpuPrep.timeout, redwood_gpu_last());
+		gGPUStat.preps++;
+		if (fence != 0 && !redwood_gpu_done(fence)) {
+			gGPUStat.prepsWaited++;
+			if (!gpuWait(fence, patience)) {
+				ret = kIOReturnBusy;
+				if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
+					waitOver(&r.cpuPrep.timeout, fence);
+				}
 			}
+			gGPUStat.prepWaiting += mach_absolute_time() - waitBegan;
 		}
 		IOLockUnlock(gGPULock);
 		slowWait("cpu-prep", waitBegan);
 		break;
+	}
 	case kMsmGemSubmit:
 		ret = submit(&r.submit);
 		break;
