@@ -118,6 +118,7 @@ public:
 	mach_vm_address_t               clientAddress;  /* ... and where it is there */
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; RedwoodGPU.cpp) */
+	uint32_t                        gpuBumps;       /* moves of the seed by locks of kSurfaceLockGPUWrote: the GPU drew, not a processor */
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;

@@ -203,6 +203,14 @@ struct redwood_worked {
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
 #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
+/*
+ * ... unless the GPU has drawn it (surface->drawn): then every gpu_push_ms (250). The display's
+ * surface is 10 MB and was pushed with nearly every submission for the sake of a writer that does
+ * not say so (see submit()); one the GPU draws into is not one a program writes on the side, and if
+ * one does, what it wrote shows a quarter of a second late, not wrong. gpu_push_all=1: as before.
+ */
+static TUNABLE(uint32_t, gGPUPushMs, "gpu_push_ms", 250);
+static TUNABLE(uint32_t, gGPUPushAll, "gpu_push_all", 0);
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
 static bool gGPUReported;
@@ -213,6 +221,7 @@ static bool gGPUSaidSetIova;                    /* MSM_INFO_SET_IOVA has been re
 static struct {
 	uint64_t since, flushing, waiting, taking;      /* times of the processor's clock */
 	uint64_t flushed;                       /* bytes sent out of the cache */
+	uint64_t flushedSeed, flushedSeen, flushedDue;  /* ... of them: a new seed, mapped by the program, in any case */
 	uint32_t submissions, commands, buffers, surfaces, waits, over;
 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
 	uint64_t making;                        /* ... and the time it took to make the others */
@@ -628,6 +637,7 @@ struct gpu_buffer {
 	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
 	uint64_t                        pushed;         /* ... and when that was */
 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+	uint32_t                        gpuBumps;       /* the surface's gpuBumps when it was last pushed */
 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
 };
 
@@ -1169,7 +1179,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 	struct msm_gem_submit_cmd * cmds = NULL;
 	uint64_t addresses[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
-	uint64_t began, nanos, again;
+	uint64_t began, nanos, again, againDrawn;
 	IOReturn ret = kIOReturnBadArgument;
 
 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
@@ -1201,6 +1211,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 	 */
 	began = mach_absolute_time();
 	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
+	nanoseconds_to_absolutetime((uint64_t) gGPUPushMs * NSEC_PER_MSEC, &againDrawn);
 	for (uint32_t i = 0; i < request->nr_bos; i++) {
 		struct gpu_buffer * b = buffer(bos[i].handle);
 
@@ -1208,12 +1219,25 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 			continue;
 		}
 		if (b->surface != NULL) {
-			uint32_t seed = b->surface->shared()->seed;
+			uint32_t seed = b->surface->shared()->seed, gpuBumps = b->surface->gpuBumps;
+			bool drawn = b->surface->drawn != 0 && !gGPUPushAll;
+			/* moves of the seed since the last push that were not the GPU's own (eagl.c's kSurfaceLockGPUWrote) */
+			bool written = seed - b->seed != (gGPUPushAll ? 0 : gpuBumps - b->gpuBumps);
 
-			if (seed == b->seed && !b->seen && began - b->pushed < again) {
+			if (!written && !b->seen && began - b->pushed < (drawn ? againDrawn : again)) {
+				b->seed = seed;
+				b->gpuBumps = gpuBumps;
 				continue;
 			}
+			if (written) {
+				gGPUStat.flushedSeed += b->size;
+			} else if (b->seen) {
+				gGPUStat.flushedSeen += b->size;
+			} else {
+				gGPUStat.flushedDue += b->size;
+			}
 			b->seed = seed;
+			b->gpuBumps = gpuBumps;
 			b->pushed = began;
 		} else if (!b->seen || !gGPUCached) {
 			continue;
@@ -1314,6 +1338,8 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
 		IOLog("RedwoodGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
 		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
+		IOLog("RedwoodGPU: out of the cache: %llu MB for a new seed, %llu MB mapped by the program, %llu MB in any case\n",
+		    gGPUStat.flushedSeed >> 20, gGPUStat.flushedSeen >> 20, gGPUStat.flushedDue >> 20);
 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "

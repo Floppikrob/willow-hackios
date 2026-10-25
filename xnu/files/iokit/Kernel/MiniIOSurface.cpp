@@ -73,6 +73,7 @@ enum {
 };
 
 #define kSurfaceLockReadOnly    1u
+#define kSurfaceLockGPUWrote    0x40000000u     /* this port's: only the GPU wrote (eagl.c) */
 
 #define MINISURF_TABLE_SIZE     16384
 #define MINISURF_MAX_DIMENSION  16384
@@ -1751,6 +1752,14 @@ IOSurfaceRootUserClient::lockCommon(uint32_t sid, uint32_t options, user_addr_t 
 		struct minisurf_shared * sh = ref->surface->shared();
 
 		if (!(options & kSurfaceLockReadOnly)) {
+			/*
+			 * A private option of this port's (userland/src/eagl.c): the lock only says that the GPU
+			 * has drawn into the surface, no processor wrote it. Readers still see a new seed; the
+			 * GPU's submissions do not push it out of the processors' caches for it (RedwoodGPU.cpp).
+			 */
+			if (options & kSurfaceLockGPUWrote) {
+				ref->surface->gpuBumps++;
+			}
 			sh->seed++;
 		}
 		seed = sh->seed;
