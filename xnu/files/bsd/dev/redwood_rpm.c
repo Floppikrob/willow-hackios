@@ -370,8 +370,18 @@ redwood_rpm_init(void)
 	char device[16] = "";
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("rpm", &steps, sizeof(steps)) || steps == 0 ||
-	    !PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
+	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
+		return;
+	}
+	if (!PE_parse_boot_argn("rpm", &steps, sizeof(steps))) {
+		uint32_t gpu = 0, a610 = 0;
+
+		/* gpu=1 (without a610=): the GPU's start (redwood_a610.c) wants the buses, so all three steps */
+		if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu && !PE_parse_boot_argn("a610", &a610, sizeof(a610))) {
+			steps = 3;
+		}
+	}
+	if (steps == 0) {
 		return;
 	}
 	if (kernel_thread_start(rpm_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {

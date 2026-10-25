@@ -4062,6 +4062,11 @@ start_by_itself(void)
 	const char *missing = NULL;
 	uint64_t size;
 
+	char device[16] = "";
+
+	if (PE_parse_boot_arg_str("device", device, sizeof(device)) && strcmp(device, "willow") == 0) {
+		return false;                   /* the willow's GPU is redwood_a610.c's (gpu=1 there too) */
+	}
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
 		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
 		return false;

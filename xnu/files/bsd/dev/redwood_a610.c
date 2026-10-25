@@ -1037,9 +1037,35 @@ zap_load(const uint8_t *header, uint32_t segments)
 #define CP_IB1_REM_SIZE         GPU_WORD(0x092a)
 #define EVENT_INVALIDATE_DEPTH  0x18
 #define EVENT_INVALIDATE_COLOR  0x19
+#define CP_IB2_BASE             GPU_WORD(0x092b)
+#define CP_IB2_REM_SIZE         GPU_WORD(0x092d)
+#define KEPT_SUBMISSIONS        64              /* the last ones' command buffers, for a report of one that hangs */
+#define KEPT_SUBMISSION_IBS     8
 
 bool a610_kept;
+static struct {
+	uint32_t fence, count;
+	uint64_t address[KEPT_SUBMISSION_IBS];
+	uint32_t words[KEPT_SUBMISSION_IBS];
+} kept_submissions[KEPT_SUBMISSIONS];
+
+/*
+ * gpu=1 on the willow (redwood_a610_init()): the GPU started while the system starts and kept for
+ * the window server, as redwood_adreno.c does with gpu=1 on the redwood -- steps 1 to 12 with the
+ * RPM's buses, the zap shader, our tables, 745 MHz, kept. Each of those boot-args may still be
+ * given to say otherwise. Without gpu=1 they are off unless given, as before.
+ */
+static bool autostart;
+
+static uint32_t
+a610_arg(const char *name, uint32_t otherwise)
+{
+	uint32_t value;
+
+	return PE_parse_boot_argn(name, &value, sizeof(value)) ? value : autostart ? otherwise : 0;
+}
 static uint32_t kept_fence, kept_timed, kept_timed_count, kept_timed_by[7];
+static volatile int a610_finished;      /* the steps are over (and the GPU kept or not) */
 static uint64_t kept_ticks;
 
 extern uint64_t redwood_gpu_address(uint64_t size);
@@ -1202,6 +1228,16 @@ a610_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
+	{
+		typeof(kept_submissions[0]) *noted = &kept_submissions[kept_fence % KEPT_SUBMISSIONS];
+
+		noted->fence = kept_fence;
+		noted->count = count < KEPT_SUBMISSION_IBS ? count : KEPT_SUBMISSION_IBS;
+		for (uint32_t i = 0; i < noted->count; i++) {
+			noted->address[i] = addresses[i];
+			noted->words[i] = words[i];
+		}
+	}
 	for (uint32_t i = 0; i < count; i++) {
 		ring_command(CP_INDIRECT_BUFFER, 3);
 		ring((uint32_t)addresses[i]);
@@ -1220,6 +1256,101 @@ a610_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	return kept_fence;
 }
 
+/* Where one of the core's addresses is, through our tables; 0: nowhere. */
+extern vm_offset_t phystokv(uint64_t pa);
+
+static uint64_t *
+space_table_at(uint64_t phys)
+{
+	for (uint32_t i = 0; i < space.count; i++) {
+		if (space.phys[i] == phys) {
+			return space.table[i];
+		}
+	}
+	return NULL;
+}
+
+static uint64_t
+space_phys(uint64_t address)
+{
+	uint64_t *level2, *level3, entry;
+
+	if (space.count == 0 || !((entry = space.table[0][address >> 30 & 0x1ff]) & 1) ||
+	    (level2 = space_table_at(entry & PTE_ADDRESS)) == NULL || !((entry = level2[address >> 21 & 0x1ff]) & 1) ||
+	    (level3 = space_table_at(entry & PTE_ADDRESS)) == NULL || !((entry = level3[address >> 12 & 0x1ff]) & 1)) {
+		return 0;
+	}
+	return (entry & PTE_ADDRESS) | (address & 0xfff);
+}
+
+/* A word of the core's memory, as the core would read it; ~0 where nothing is mapped. */
+static uint32_t
+core_word(uint64_t address)
+{
+	uint64_t phys = space_phys(address);
+	vm_offset_t at;
+
+	if (phys == 0) {
+		return ~0u;
+	}
+	at = phystokv(phys);
+	__asm__ volatile ("dc civac, %0" : : "r" (at));
+	__builtin_arm_dsb(0xf);
+	return *(volatile uint32_t *)at;
+}
+
+/*
+ * A command buffer the core is in, packet by packet from its start: which type-7 packets it has
+ * (their opcodes), and the last ones before `at` (where the core has fetched up to). An opcode the
+ * core's microcode does not know is what CP_ILLEGAL_INSTR_ERROR says it met.
+ */
+static void
+kept_walk(const char *name, uint64_t start, uint32_t words, uint64_t at)
+{
+	uint32_t offset = 0, packets = 0, last[8][3], lasts = 0, calls = 0;
+	uint64_t seen[2] = { 0, 0 };            /* opcodes 0-127 */
+
+	while (offset < words && offset < 65536) {
+		uint32_t header = core_word(start + 4 * offset), size, opcode = ~0u;
+
+		if (header >> 28 == 7) {
+			opcode = header >> 16 & 0x7f;
+			size = header & 0x3fff;
+			seen[opcode >> 6] |= 1ull << (opcode & 63);
+			if (opcode == CP_INDIRECT_BUFFER && size >= 3 && calls < 4) {
+				/* a second-level buffer this one calls: where, and how long */
+				printf("a610: gpu:     word %u calls %#llx, %u words\n", offset,
+				    (uint64_t)core_word(start + 4 * offset + 8) << 32 | core_word(start + 4 * offset + 4),
+				    core_word(start + 4 * offset + 12) & 0xfffff);
+				calls++;
+			}
+		} else if (header >> 28 == 4) {
+			size = header & 0x7f;
+		} else {
+			printf("a610: gpu:   %s: word %u is %#x, not a packet: the walk stops\n", name, offset, header);
+			break;
+		}
+		if (start + 4 * offset < at || at == 0) {
+			last[lasts % 8][0] = offset;
+			last[lasts % 8][1] = header;
+			last[lasts % 8][2] = opcode;
+			lasts++;
+		}
+		offset += 1 + size;
+		packets++;
+	}
+	printf("a610: gpu:   %s at %#llx, %u words: %u packets; type-7 opcodes:", name, start, words, packets);
+	for (uint32_t op = 0; op < 128; op++) {
+		if (seen[op >> 6] >> (op & 63) & 1) {
+			printf(" %#x", op);
+		}
+	}
+	printf("\n");
+	for (uint32_t i = lasts > 8 ? lasts - 8 : 0; i < lasts; i++) {
+		printf("a610: gpu:     word %u: %#010x (opcode %#x)\n", last[i % 8][0], last[i % 8][1], last[i % 8][2]);
+	}
+}
+
 void
 a610_gpu_report(const char *why)
 {
@@ -1230,6 +1361,28 @@ a610_gpu_report(const char *why)
 	    rd(gpu + CP_PROTECT_STATUS), (uint64_t)rd(gpu + CP_IB1_BASE + 4) << 32 | rd(gpu + CP_IB1_BASE),
 	    rd(gpu + CP_IB1_REM_SIZE));
 	(void)space_faulted("the submission");
+	{
+		uint32_t done = *(volatile uint32_t *)(kept_scratch() + KEPT_FENCE_AT);
+		uint64_t ib1 = (uint64_t)rd(gpu + CP_IB1_BASE + 4) << 32 | rd(gpu + CP_IB1_BASE);
+		uint64_t ib2 = (uint64_t)rd(gpu + CP_IB2_BASE + 4) << 32 | rd(gpu + CP_IB2_BASE);
+		typeof(kept_submissions[0]) *stuck = &kept_submissions[(done + 1) % KEPT_SUBMISSIONS];
+
+		printf("a610: gpu:   the second level: at %#llx, %u words to go; its words there:", ib2, rd(gpu + CP_IB2_REM_SIZE));
+		for (int i = -8; i < 8; i++) {
+			printf(" %08x", core_word(ib2 + 4 * i));
+		}
+		printf("\n");
+		kept_walk("the second level from there", ib2, rd(gpu + CP_IB2_REM_SIZE), 0);
+		if (stuck->fence == done + 1) {
+			for (uint32_t i = 0; i < stuck->count; i++) {
+				char name[48];
+
+				snprintf(name, sizeof(name), "submission %u, buffer %u", stuck->fence, i);
+				kept_walk(name, stuck->address[i], stuck->words[i],
+				    ib1 >= stuck->address[i] && ib1 <= stuck->address[i] + 4ull * stuck->words[i] ? ib1 : 0);
+			}
+		}
+	}
 }
 
 /*
@@ -1361,7 +1514,7 @@ kept_start(bool good)
 {
 	uint32_t keep = 0, selftest = 0;
 
-	if (!PE_parse_boot_argn("a610_keep", &keep, sizeof(keep)) || !keep) {
+	if (!(keep = a610_arg("a610_keep", 1))) {
 		return;
 	}
 	if (!good || !zap_loaded || core_address != CORE_ADDRESS) {
@@ -1393,7 +1546,7 @@ a610_thread(void *parameter, __unused wait_result_t result)
 		/* with rpm=N: the RPM's requests first (bsd/dev/redwood_rpm.c), the GPU's path to memory runs on its buses */
 		uint32_t rpm = 0;
 
-		if (PE_parse_boot_argn("rpm", &rpm, sizeof(rpm)) && rpm != 0) {
+		if ((rpm = a610_arg("rpm", 3)) != 0) {
 			for (int i = 0; i < 500 && !redwood_rpm_done; i++) {
 				delay_for_interval(10, NSEC_PER_MSEC);
 			}
@@ -1509,7 +1662,7 @@ a610_thread(void *parameter, __unused wait_result_t result)
 	{
 		uint32_t mhz = 0;
 
-		if (PE_parse_boot_argn("a610_mhz", &mhz, sizeof(mhz)) && mhz != 0) {
+		if ((mhz = a610_arg("a610_mhz", 745)) != 0) {
 			core_mhz = core_speed(mhz);
 		}
 	}
@@ -1636,7 +1789,7 @@ a610_thread(void *parameter, __unused wait_result_t result)
 		/* a610_zap=1: here TrustZone answers "interrupted" for 20 s and more, so the step is left out unless asked for */
 		uint32_t zap = 0;
 
-		PE_parse_boot_argn("a610_zap", &zap, sizeof(zap));
+		zap = a610_arg("a610_zap", 1);
 		if (!zap) {
 			printf("a610: left out (a610_zap=1 to ask)\n");
 			goto step10;
@@ -1752,7 +1905,7 @@ step10:
 		uint32_t bypass = 0, translate = 0;
 
 		PE_parse_boot_argn("a610_bypass", &bypass, sizeof(bypass));
-		PE_parse_boot_argn("a610_smmu", &translate, sizeof(translate));
+		translate = a610_arg("a610_smmu", 1);
 		core_address = core_phys;
 		if (translate && smmu != 0) {
 			/* our tables: the ring, the microcode and the page at CORE_ADDRESS, nothing else yet */
@@ -2041,21 +2194,46 @@ step10:
 out:
 	printf("a610: stopping after step %u (a610=%u)\n", steps < 13 ? steps : 13, steps);
 	kept_start(core_good);
+	a610_finished = 1;
 	thread_terminate(current_thread());
 }
 
 void
 redwood_a610_init(void)
 {
-	uint32_t steps = 0;
+	uint32_t steps = 0, gpu = 0;
 	char device[16] = "";
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("a610", &steps, sizeof(steps)) || steps == 0 ||
-	    !PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
+	if (!PE_parse_boot_arg_str("device", device, sizeof(device)) || strcmp(device, "willow") != 0) {
 		return;
 	}
-	if (kernel_thread_start(a610_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
-		thread_deallocate(thread);
+	if (!PE_parse_boot_argn("a610", &steps, sizeof(steps))) {
+		if (!(PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu)) {
+			return;
+		}
+		autostart = true;
+		steps = 12;
+	}
+	if (steps == 0 || kernel_thread_start(a610_thread, (void *)(uintptr_t)steps, &thread) != KERN_SUCCESS) {
+		return;
+	}
+	thread_deallocate(thread);
+	if (autostart) {
+		/*
+		 * The service RedwoodGPU is there before the first program runs, or not at all: the
+		 * window server decides once, when it starts, whether CoreAnimation draws by the GPU
+		 * (userland src/inject.c, opengl_es()). So the system waits for the steps, as it does
+		 * for redwood_adreno.c's -- at most 30 s; they take a few.
+		 */
+		uint64_t began = mach_absolute_time(), ns;
+
+		for (int i = 0; i < 3000 && !a610_finished; i++) {
+			delay_for_interval(10, NSEC_PER_MSEC);
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		printf("a610: gpu=1: the GPU's start took %llu ms: %s\n", ns / 1000000, !a610_finished ?
+		    "NOT OVER after 30 s, the system goes on (it draws in software)" : a610_kept ?
+		    "kept for the window server" : "not kept (see above); the system draws in software");
 	}
 }
