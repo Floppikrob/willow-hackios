@@ -59,6 +59,12 @@
  * every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
+/*
+ * A lock that only moves the surface's seed to say the GPU has drawn into it: no processor wrote it,
+ * so the kernel's GPU service does not push the surface out of the processors' caches for it
+ * (kSurfaceLockGPUWrote, iokit/Kernel/MiniIOSurface.h and RedwoodGPU.cpp in the kernel).
+ */
+#define LOCK_GPU_WROTE  0x40000000u
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
@@ -780,15 +786,15 @@ target_to_surface(struct eagl *e, struct image *image)
 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		if (IOSurfaceLock(surface, LOCK_GPU_WROTE, NULL) == 0) {
+			IOSurfaceUnlock(surface, LOCK_GPU_WROTE, NULL);
 		}
 		return;
 	}
 	if (image->shared) {
 		/* whoever looks at the surface's seed is to see that it has changed */
-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
-			IOSurfaceUnlock(surface, 0, NULL);
+		if (IOSurfaceLock(surface, LOCK_GPU_WROTE, NULL) == 0) {
+			IOSurfaceUnlock(surface, LOCK_GPU_WROTE, NULL);
 		}
 		return;
 	}
