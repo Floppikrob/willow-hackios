@@ -16,6 +16,9 @@
  *                         title if there is one, and the answer's own "x-" headers -- where Apple's
  *                         services say what they decided (X-Set-Apple-Store-Front; rc.jobs.store)
  *   reach NAME            what SCNetworkReachability says: the question applications ask first
+ *   static IF ADDR        ADDR/16 on IF and IF up, by the kernel's own requests (SIOCAIFADDR, SIOCSIFFLAGS),
+ *                         without configd: the USB cable to the computer (usb=9), where nothing answers DHCP
+ *                         and Windows takes a 169.254 address of its own -- so 169.254.x.y is the one to give
  *   wait SECONDS
  *   wifi                  what the job com.redwood.wifi runs in every image: if the kernel was
  *                         started with wifi=1, wait for the radio's interface (en0) to appear,
@@ -545,6 +548,55 @@ wrongjoin(void)
 	close(s);
 }
 
+/* static IF ADDR: see the usage above */
+static void
+static_address(const char *interface, const char *address)
+{
+	struct ifaliasreq ifra;
+	struct ifreq ifr;
+	struct sockaddr_in *sin;
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (s < 0) {
+		printf("net_test: static: socket: %s\n", strerror(errno));
+		return;
+	}
+	memset(&ifra, 0, sizeof(ifra));
+	strlcpy(ifra.ifra_name, interface, sizeof(ifra.ifra_name));
+	sin = (struct sockaddr_in *)&ifra.ifra_addr;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	if (inet_pton(AF_INET, address, &sin->sin_addr) != 1) {
+		printf("net_test: static: %s is not an IPv4 address\n", address);
+		close(s);
+		return;
+	}
+	sin = (struct sockaddr_in *)&ifra.ifra_mask;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = htonl(0xffff0000u);
+	sin = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	inet_pton(AF_INET, address, &sin->sin_addr);
+	sin->sin_addr.s_addr |= htonl(0x0000ffffu);
+	if (ioctl(s, SIOCAIFADDR, &ifra) != 0) {
+		printf("net_test: static: %s on %s: %s\n", address, interface, strerror(errno));
+	} else {
+		printf("net_test: static: %s/16 on %s\n", address, interface);
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, interface, sizeof(ifr.ifr_name));
+	if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+		ifr.ifr_flags |= IFF_UP;
+		if (ioctl(s, SIOCSIFFLAGS, &ifr) != 0) {
+			printf("net_test: static: %s up: %s\n", interface, strerror(errno));
+		}
+	}
+	close(s);
+	show(interface, false);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -578,6 +630,9 @@ main(int argc, char **argv)
 				fetch(argv[++i]);
 			} else if (strcmp(step, "reach") == 0 && i + 1 < argc) {
 				reach(argv[++i]);
+			} else if (strcmp(step, "static") == 0 && i + 2 < argc) {
+				static_address(argv[i + 1], argv[i + 2]);
+				i += 2;
 			} else if (strcmp(step, "wait") == 0 && i + 1 < argc) {
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
 			} else if (strcmp(step, "wifi") == 0) {

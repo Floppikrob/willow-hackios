@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.caches), on the willow with var_disk=1:
+# what Mesa and others keep in /private/var between boots (src/show_files.c, the list only).
+/redwood/bin/show_files /private/var/mobile/.cache
+/redwood/bin/show_files /private/var/root/.cache

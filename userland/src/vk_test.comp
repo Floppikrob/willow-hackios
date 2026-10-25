@@ -1,0 +1,11 @@
+#version 450
+// vk_test's compute shader (src/vk_test.c): every word of the buffer times one constant, plus the
+// other and its own index, so that a word in the wrong place or left alone shows.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Data { uint data[]; };
+layout(push_constant) uniform Constants { uint mul; uint add; } k;
+void main()
+{
+	uint i = gl_GlobalInvocationID.x;
+	data[i] = data[i] * k.mul + k.add + i;
+}

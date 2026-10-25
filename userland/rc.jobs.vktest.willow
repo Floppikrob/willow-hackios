@@ -1,0 +1,7 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.vktest.willow), on the willow.
+# Vulkan: Mesa's turnip (share/vulkan/libvulkan_freedreno.dylib, built by tools/mk-mesa.sh's turnip
+# tree) on the Adreno 610 the kernel kept on (gpu=1), loaded by src/vk_test.c without a loader. The
+# window server draws without GL meanwhile, so the GPU is vk_test's alone.
+# The wait is cpu_test's: the GPU service is there some 40 s into the boot (rc.jobs.gltest.willow).
+/redwood/bin/cpu_test 40
+/redwood/bin/vk_test

@@ -820,6 +820,46 @@ read_whole(const char *path, char *buf, size_t size)
 	return (ssize_t)got;
 }
 
+/*
+ * The arguments of an HFS mount (Apple's hfs, core/hfs_mount.h, struct hfs_mount_args as a program
+ * passes it): -1 (VNOVAL) wherever the volume's own is to stand.
+ */
+struct hfs_args {
+	char *fspec;
+	uint32_t uid, gid;
+	uint16_t mask;
+	uint32_t encoding;
+	struct {
+		int minuteswest, dsttime;
+	} timezone;
+	int flags, journal_tbuffer_size, journal_flags, journal_disable;
+};
+
+/*
+ * Boot-arg var_disk=1: /private/var on the flash, the HFS+ volume of the data store (the kernel's
+ * bsd/hfs, built in; the partition that takes writes with ufs_write=data: willow's userdata,
+ * scripts/hfs-extents.py put the volume there). 1 if it is mounted.
+ */
+static int
+mount_var_disk(void)
+{
+	const char *wanted = boot_arg("var_disk");
+	struct hfs_args args = {
+		.fspec = "/dev/ufs_userdata", .uid = 0xffffffffu, .gid = 0xffffffffu, .mask = 0xffff,
+		.encoding = 0, .timezone = { -1, 0 }, .flags = 0,
+	};
+
+	if (wanted == NULL || strcmp(wanted, "1") != 0) {
+		return 0;
+	}
+	if (mount("hfs", "/private/var", 0, &args) != 0) {
+		printf("  hfs %s on /private/var: %s; a memory filesystem instead\n", args.fspec, strerror(errno));
+		return 0;
+	}
+	printf("  /private/var is the HFS+ volume %s on the flash (var_disk=1)\n", args.fspec);
+	return 1;
+}
+
 static void
 mount_writable(void)
 {
@@ -829,13 +869,15 @@ mount_writable(void)
 	int ok, fd, made = 0, files = 0;
 	const char *jb;
 	struct stat st;
+	int on_disk;
 
 	printf("\n-- writable filesystem --\n");
-	ok = mount("ramfs", "/private/var", 0, NULL) == 0;
+	on_disk = mount_var_disk();
+	ok = on_disk || mount("ramfs", "/private/var", 0, NULL) == 0;
 	if (!ok) {
 		printf("  mount: %s\n", strerror(errno));
 	}
-	check(ok, "mount a memory filesystem on /private/var");
+	check(ok, on_disk ? "mount the data volume on /private/var" : "mount a memory filesystem on /private/var");
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (ios165/mkvarskel.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
@@ -850,14 +892,15 @@ mount_writable(void)
 		if (count == 5 && f[0][0] == 'd') {
 			int mode = (int)parse_number(f[1], 8);
 
-			ok = mkdir(f[4], mode) == 0 && chmod(f[4], mode) == 0 &&
+			/* (a volume on the flash has them from the boot before: there is nothing to make) */
+			ok = (mkdir(f[4], mode) == 0 || (on_disk && errno == 17 /* EEXIST */)) && chmod(f[4], mode) == 0 &&
 			    chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) == 0;
 			if (!ok) {
 				printf("  %s: %s\n", f[4], strerror(errno));
 			}
 			made++;
 		} else if (count == 3 && f[0][0] == 'l') {
-			symlink(f[1], f[2]);
+			symlink(f[1], f[2]);            /* (EEXIST on a volume from the boot before: kept) */
 		} else if (count == 6 && f[0][0] == 'f') {
 			/* a file of ours to start with (build.sh: the var/ directory): mode, owner, group, path, source in the image */
 			if (!copy_file(in_image(f[5]), f[4], (int)parse_number(f[1], 8), (int)parse_number(f[2], 10),

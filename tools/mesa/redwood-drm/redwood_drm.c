@@ -8,13 +8,18 @@
  * there is one GPU and one connection to it in a process.
  */
 #include <errno.h>
+#include <mach/mach_time.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
 
 #include "xf86drm.h"
+#include "drm-uapi/msm_drm.h"
 
 #define REDWOOD_GPU_SERVICE     "RedwoodGPU"
 #define REDWOOD_GPU_SURFACE     0x7e            /* the request that is not Linux's */
@@ -95,10 +100,15 @@ drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long siz
 	return -call((unsigned)(DRM_COMMAND_BASE + index), (void *)(uintptr_t)data, size);
 }
 
+static int submit_with_syncobjs(struct drm_msm_gem_submit *request, unsigned long size);
+
 int
 drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
 {
 	(void)fd;
+	if (index == DRM_MSM_GEM_SUBMIT && size >= sizeof(struct drm_msm_gem_submit)) {
+		return submit_with_syncobjs(data, size);
+	}
 	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
 }
 
@@ -211,11 +221,274 @@ none(void)
 #define NONE(name, ...) int name(__VA_ARGS__) { return none(); }
 NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
     __attribute__((unused)) uint32_t flags, __attribute__((unused)) int *prime_fd)
-NONE(drmSyncobjCreate, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t flags,
-    __attribute__((unused)) uint32_t *handle)
-NONE(drmSyncobjDestroy, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle)
-NONE(drmSyncobjReset, __attribute__((unused)) int fd, __attribute__((unused)) const uint32_t *handles,
-    __attribute__((unused)) uint32_t count)
+NONE(drmSyncobjQuery, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t *handles,
+    __attribute__((unused)) uint64_t *points, __attribute__((unused)) uint32_t count)
+NONE(drmSyncobjTimelineSignal, __attribute__((unused)) int fd, __attribute__((unused)) const uint32_t *handles,
+    __attribute__((unused)) uint64_t *points, __attribute__((unused)) uint32_t count)
+NONE(drmSyncobjTimelineWait, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t *handles,
+    __attribute__((unused)) uint64_t *points, __attribute__((unused)) unsigned count,
+    __attribute__((unused)) int64_t timeout_nsec, __attribute__((unused)) unsigned flags,
+    __attribute__((unused)) uint32_t *first_signaled)
+NONE(drmSyncobjTransfer, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t dst_handle,
+    __attribute__((unused)) uint64_t dst_point, __attribute__((unused)) uint32_t src_handle,
+    __attribute__((unused)) uint64_t src_point, __attribute__((unused)) uint32_t flags)
+NONE(drmGetDevice2, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t flags,
+    __attribute__((unused)) drmDevicePtr *device)
+
+void
+drmFreeDevice(drmDevicePtr *device)
+{
+	(void)device;
+}
+
+int
+drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
+{
+	return a == b;
+}
+
+/*
+ * ---- synchronisation objects, in the process ----
+ *
+ * Linux keeps them in the kernel: a fence each, that a submission is given to signal and another
+ * waits for. Here the kernel knows only its submissions' numbers, which a wait can be asked
+ * about (MSM_WAIT_FENCE), so an object is kept here: signalled, or waiting for submission N, or
+ * neither. A submission with objects to wait for (MSM_SUBMIT_SYNCOBJ_IN) waits for them here
+ * before it goes to the kernel; those it is to signal (MSM_SUBMIT_SYNCOBJ_OUT) are given its
+ * number when it comes back. One process's objects: there is no passing them to another one.
+ */
+#define SYNCOBJS 4096
+
+static struct {
+	bool used, signalled;
+	uint32_t fence, queue;                  /* waiting for that submission (0: for nothing yet) */
+} syncobjs[SYNCOBJS];
+static pthread_mutex_t syncobjs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+fail(int error)
+{
+	errno = error;
+	return -error;
+}
+
+int
+drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+	(void)fd;
+	pthread_mutex_lock(&syncobjs_lock);
+	for (uint32_t i = 0; i < SYNCOBJS; i++) {
+		if (!syncobjs[i].used) {
+			syncobjs[i].used = true;
+			syncobjs[i].signalled = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) != 0;
+			syncobjs[i].fence = 0;
+			pthread_mutex_unlock(&syncobjs_lock);
+			*handle = i + 1;
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&syncobjs_lock);
+	return fail(ENOMEM);
+}
+
+static bool
+valid(uint32_t handle)
+{
+	return handle >= 1 && handle <= SYNCOBJS && syncobjs[handle - 1].used;
+}
+
+int
+drmSyncobjDestroy(int fd, uint32_t handle)
+{
+	(void)fd;
+	pthread_mutex_lock(&syncobjs_lock);
+	if (!valid(handle)) {
+		pthread_mutex_unlock(&syncobjs_lock);
+		return fail(EINVAL);
+	}
+	syncobjs[handle - 1].used = false;
+	pthread_mutex_unlock(&syncobjs_lock);
+	return 0;
+}
+
+static int
+set_state(const uint32_t *handles, uint32_t count, bool signalled)
+{
+	pthread_mutex_lock(&syncobjs_lock);
+	for (uint32_t i = 0; i < count; i++) {
+		if (!valid(handles[i])) {
+			pthread_mutex_unlock(&syncobjs_lock);
+			return fail(EINVAL);
+		}
+		syncobjs[handles[i] - 1].signalled = signalled;
+		syncobjs[handles[i] - 1].fence = 0;
+	}
+	pthread_mutex_unlock(&syncobjs_lock);
+	return 0;
+}
+
+int
+drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count)
+{
+	(void)fd;
+	return set_state(handles, count, false);
+}
+
+int
+drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count)
+{
+	(void)fd;
+	return set_state(handles, count, true);
+}
+
+/* Now, on the clock the kernel's timeouts are on (iokit/Kernel/RedwoodGPU.cpp: millisecondsUntil). */
+static uint64_t
+continuous_ns(void)
+{
+	static mach_timebase_info_data_t timebase;
+
+	if (timebase.denom == 0) {
+		mach_timebase_info(&timebase);
+	}
+	return mach_continuous_time() * timebase.numer / timebase.denom;
+}
+
+/* Whether submission `fence` is done; waits up to a millisecond for it. */
+static bool
+fence_done(uint32_t fence, uint32_t queue)
+{
+	uint64_t until = continuous_ns() + 1000000;
+	struct drm_msm_wait_fence request = {
+		.fence = fence,
+		.timeout = { .tv_sec = (int64_t)(until / 1000000000), .tv_nsec = (int64_t)(until % 1000000000) },
+		.queueid = queue,
+	};
+
+	return call(DRM_COMMAND_BASE + DRM_MSM_WAIT_FENCE, &request, sizeof(request)) == 0;
+}
+
+/* One object's state: 1 signalled, 0 not yet, -1 not even given a submission. */
+static int
+syncobj_state(uint32_t handle)
+{
+	uint32_t fence, queue;
+
+	pthread_mutex_lock(&syncobjs_lock);
+	if (syncobjs[handle - 1].signalled) {
+		pthread_mutex_unlock(&syncobjs_lock);
+		return 1;
+	}
+	fence = syncobjs[handle - 1].fence;
+	queue = syncobjs[handle - 1].queue;
+	pthread_mutex_unlock(&syncobjs_lock);
+	if (fence == 0) {
+		return -1;
+	}
+	if (!fence_done(fence, queue)) {
+		return 0;
+	}
+	pthread_mutex_lock(&syncobjs_lock);
+	if (syncobjs[handle - 1].fence == fence) {
+		syncobjs[handle - 1].signalled = true;
+	}
+	pthread_mutex_unlock(&syncobjs_lock);
+	return 1;
+}
+
+/* timeout_nsec: an absolute time on CLOCK_MONOTONIC, as libdrm's */
+int
+drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, unsigned flags,
+    uint32_t *first_signaled)
+{
+	(void)fd;
+	for (unsigned i = 0; i < count; i++) {
+		if (!valid(handles[i])) {
+			return fail(EINVAL);
+		}
+	}
+	for (;;) {
+		unsigned done = 0, first = count;
+		struct timespec now;
+
+		for (unsigned i = 0; i < count; i++) {
+			int state = syncobj_state(handles[i]);
+
+			if (state < 0 && !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)) {
+				return fail(EINVAL);
+			}
+			if (state > 0) {
+				done++;
+				if (first == count) {
+					first = i;
+				}
+			}
+		}
+		if ((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? done == count : done > 0) {
+			if (first_signaled != NULL) {
+				*first_signaled = first;
+			}
+			return 0;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((int64_t)now.tv_sec * 1000000000 + now.tv_nsec >= timeout_nsec) {
+			return fail(ETIME);
+		}
+		usleep(50);
+	}
+}
+
+static int
+submit_with_syncobjs(struct drm_msm_gem_submit *request, unsigned long size)
+{
+	uint32_t flags = request->flags, stride = request->syncobj_stride ? request->syncobj_stride :
+	    sizeof(struct drm_msm_gem_submit_syncobj);
+	uint64_t ins = request->in_syncobjs, outs = request->out_syncobjs;
+	uint32_t nr_in = request->nr_in_syncobjs, nr_out = request->nr_out_syncobjs;
+	int error;
+
+	if (flags & MSM_SUBMIT_SYNCOBJ_IN) {
+		for (uint32_t i = 0; i < nr_in; i++) {
+			struct drm_msm_gem_submit_syncobj *in = (void *)(uintptr_t)(ins + (uint64_t)i * stride);
+			uint32_t handle = in->handle;
+			struct timespec now;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			if (!valid(handle) || drmSyncobjWait(-1, &handle, 1, (int64_t)now.tv_sec * 1000000000 + now.tv_nsec +
+			    5000000000ll, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL) != 0) {
+				return fail(EINVAL);
+			}
+			if (in->flags & MSM_SUBMIT_SYNCOBJ_RESET) {
+				drmSyncobjReset(-1, &handle, 1);
+			}
+		}
+	}
+	request->flags &= ~(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
+	request->in_syncobjs = request->out_syncobjs = 0;
+	request->nr_in_syncobjs = request->nr_out_syncobjs = 0;
+	error = call(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, request, size);
+	request->flags = flags;
+	request->in_syncobjs = ins;
+	request->out_syncobjs = outs;
+	request->nr_in_syncobjs = nr_in;
+	request->nr_out_syncobjs = nr_out;
+	if (error != 0) {
+		return -error;
+	}
+	if (flags & MSM_SUBMIT_SYNCOBJ_OUT) {
+		pthread_mutex_lock(&syncobjs_lock);
+		for (uint32_t i = 0; i < nr_out; i++) {
+			struct drm_msm_gem_submit_syncobj *out = (void *)(uintptr_t)(outs + (uint64_t)i * stride);
+
+			if (valid(out->handle)) {
+				syncobjs[out->handle - 1].signalled = false;
+				syncobjs[out->handle - 1].fence = request->fence;
+				syncobjs[out->handle - 1].queue = request->queueid;
+			}
+		}
+		pthread_mutex_unlock(&syncobjs_lock);
+	}
+	return 0;
+}
 NONE(drmSyncobjFDToHandle, __attribute__((unused)) int fd, __attribute__((unused)) int obj_fd,
     __attribute__((unused)) uint32_t *handle)
 NONE(drmSyncobjHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,

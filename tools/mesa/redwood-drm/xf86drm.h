@@ -15,6 +15,10 @@
 
 #include "drm-uapi/drm.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define DRM_NODE_PRIMARY        0
 #define DRM_NODE_RENDER         2
 #define DRM_CLOEXEC             O_CLOEXEC
@@ -52,6 +56,43 @@ int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
 int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
 int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
 int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
+/*
+ * The rest of libdrm's synchronisation objects, for Mesa's Vulkan driver (turnip): kept here, in
+ * the process, on top of the kernel's submission numbers (redwood_drm.c). Binary ones only: what
+ * turnip wants of a timeline it makes for itself (vk_sync_timeline) where the kernel has none.
+ */
+int drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, unsigned flags,
+    uint32_t *first_signaled);
+int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count);
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count);
+int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points, uint32_t count);
+int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned count, int64_t timeout_nsec,
+    unsigned flags, uint32_t *first_signaled);
+int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle, uint64_t src_point,
+    uint32_t flags);
+
+/* What the window system's code of Mesa's Vulkan asks of a device: there is none to compare here. */
+#define DRM_BUS_PCI             0
+typedef struct _drmPciBusInfo {
+	uint16_t domain;
+	uint8_t bus, dev, func;
+} drmPciBusInfo, *drmPciBusInfoPtr;
+typedef struct _drmDevice {
+	char **nodes;
+	int available_nodes;
+	int bustype;
+	union {
+		drmPciBusInfoPtr pci;
+		void *other;
+	} businfo;
+	union {
+		void *pci;
+		void *other;
+	} deviceinfo;
+} drmDevice, *drmDevicePtr;
+int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device);
+void drmFreeDevice(drmDevicePtr *device);
+int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b);
 
 /* Not libdrm's: a buffer's memory in this process, in place of mmap() on the device (freedreno_bo.c is patched to call these). */
 void *redwood_drm_map(int fd, uint32_t handle, uint64_t size);
@@ -72,5 +113,9 @@ struct redwood_drm_surface {
 	uint32_t width, height, pixel_format, planes;   /* and what they are */
 };
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

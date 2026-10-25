@@ -1,0 +1,185 @@
+diff -ruN -x 'build*' -x .git mesa-25.0.7/meson.build mesa-turnip/meson.build
+--- mesa-25.0.7/meson.build	2026-10-24 23:27:53.203538136 +0000
++++ mesa-turnip/meson.build	2026-10-25 15:56:25.102255813 +0000
+@@ -1716,7 +1716,7 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and with_gallium_freedreno
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_freedreno_vk)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/redwood-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+   # source file is built with freedreno's drm layer, src/freedreno/drm).
+diff -ruN -x 'build*' -x .git mesa-25.0.7/src/freedreno/vulkan/meson.build mesa-turnip/src/freedreno/vulkan/meson.build
+--- mesa-25.0.7/src/freedreno/vulkan/meson.build	2025-05-28 15:20:23.000000000 +0000
++++ mesa-turnip/src/freedreno/vulkan/meson.build	2026-10-25 16:16:23.315288135 +0000
+@@ -100,6 +100,9 @@
+ if freedreno_kmds.contains('msm')
+   tu_flags += '-DTU_HAS_MSM'
+   libtu_files += files('tu_knl_drm_msm.cc', 'tu_knl_drm.cc')
++  if host_machine.system() == 'darwin'
++    libtu_files += files('../../redwood-drm/redwood_drm.c')
++  endif
+   tu_deps += dep_libdrm
+ endif
+ 
+@@ -181,7 +184,7 @@
+   c_args : [no_override_init_args, tu_flags],
+   cpp_args : [tu_cpp_args, tu_flags],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
++  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id] + (host_machine.system() == 'darwin' ? ['-Wl,-undefined,dynamic_lookup'] : []),
+   link_depends : vulkan_icd_link_depends,
+   install : true,
+ )
+diff -ruN -x 'build*' -x .git mesa-25.0.7/src/freedreno/vulkan/tu_device.cc mesa-turnip/src/freedreno/vulkan/tu_device.cc
+--- mesa-25.0.7/src/freedreno/vulkan/tu_device.cc	2025-05-28 15:20:23.000000000 +0000
++++ mesa-turnip/src/freedreno/vulkan/tu_device.cc	2026-10-25 15:56:25.104135313 +0000
+@@ -2709,7 +2709,7 @@
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
+-   if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
++   if (0) {   /* Darwin: no pthread_condattr_setclock */
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+                                  VK_ERROR_INITIALIZATION_FAILED,
+diff -ruN -x 'build*' -x .git mesa-25.0.7/src/freedreno/vulkan/tu_knl.cc mesa-turnip/src/freedreno/vulkan/tu_knl.cc
+--- mesa-25.0.7/src/freedreno/vulkan/tu_knl.cc	2025-05-28 15:20:23.000000000 +0000
++++ mesa-turnip/src/freedreno/vulkan/tu_knl.cc	2026-10-25 16:34:22.255413639 +0000
+@@ -7,6 +7,9 @@
+  * Copyright © 2015 Intel Corporation
+  */
+ 
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
+ #include <fcntl.h>
+ 
+ #ifdef MAJOR_IN_MKDEV
+@@ -194,7 +197,16 @@
+ if (!(DETECT_ARCH_AARCH64 || DETECT_ARCH_X86 || DETECT_ARCH_X86_64))
+    return 0;
+ 
+-#if DETECT_ARCH_AARCH64 &&                                                   \
++#if DETECT_ARCH_AARCH64 && defined(__APPLE__)
++   /* Darwin on redwood: XNU leaves SCTLR_EL1.UCT clear, so CTR_EL0 is not readable from user space
++    * (an mrs of it is an undefined instruction); the kernel has the line size. dc civac / dc cvac
++    * are allowed (SCTLR_EL1.UCI is set). */
++   uint32_t line = 0;
++   size_t length = sizeof(line);
++   if (sysctlbyname("hw.cachelinesize", &line, &length, NULL, 0) != 0 || line == 0)
++      line = 64;
++   return line;
++#elif DETECT_ARCH_AARCH64 && \
+    (!defined(_SC_LEVEL1_DCACHE_LINESIZE) || DETECT_OS_ANDROID)
+    /* Bionic does not implement _SC_LEVEL1_DCACHE_LINESIZE properly: */
+    uint64_t ctr_el0;
+@@ -323,10 +335,40 @@
+ /**
+  * Enumeration entrypoint specific to non-drm devices (ie. kgsl)
+  */
++#if defined(__APPLE__) && defined(TU_HAS_MSM)
++VkResult tu_redwood_load(struct tu_instance *instance, int *fd, struct tu_physical_device **device);
++#endif
++
+ VkResult
+ tu_enumerate_devices(struct vk_instance *vk_instance)
+ {
+-#ifdef TU_HAS_KGSL
++#if defined(__APPLE__) && defined(TU_HAS_MSM)
++   /*
++    * Darwin on redwood: no /dev/dri to look through. The kernel's GPU service (RedwoodGPU,
++    * reached through src/redwood-drm, libdrm's stand-in) is the one device; its file
++    * descriptor means nothing (/dev/null), the requests go by the process's one connection.
++    */
++   struct tu_instance *instance = container_of(vk_instance, struct tu_instance, vk);
++   struct tu_physical_device *device = NULL;
++   int fd;
++   VkResult result = tu_redwood_load(instance, &fd, &device);
++
++   if (result != VK_SUCCESS)
++      return result;
++   device->master_fd = -1;
++   device->kgsl_dma_fd = -1;
++   snprintf(device->fd_path, ARRAY_SIZE(device->fd_path), "%s", "/dev/null");
++   device->has_master = false;
++   device->has_local = false;
++   result = tu_physical_device_init(device, instance);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      vk_free(&instance->vk.alloc, device);
++      return result;
++   }
++   list_addtail(&device->vk.link, &instance->vk.physical_devices.list);
++   return VK_SUCCESS;
++#elif defined(TU_HAS_KGSL)
+    struct tu_instance *instance =
+       container_of(vk_instance, struct tu_instance, vk);
+ 
+diff -ruN -x 'build*' -x .git mesa-25.0.7/src/freedreno/vulkan/tu_knl_drm.cc mesa-turnip/src/freedreno/vulkan/tu_knl_drm.cc
+--- mesa-25.0.7/src/freedreno/vulkan/tu_knl_drm.cc	2025-05-28 15:20:23.000000000 +0000
++++ mesa-turnip/src/freedreno/vulkan/tu_knl_drm.cc	2026-10-25 16:13:28.449714730 +0000
+@@ -72,7 +72,11 @@
+ 
+    if (bo->map) {
+       TU_RMV(bo_unmap, dev, bo);
++#ifdef __APPLE__
++      redwood_drm_unmap(dev->fd, bo->gem_handle, bo->map);
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    TU_RMV(bo_destroy, dev, bo);
+diff -ruN -x 'build*' -x .git mesa-25.0.7/src/freedreno/vulkan/tu_knl_drm_msm.cc mesa-turnip/src/freedreno/vulkan/tu_knl_drm_msm.cc
+--- mesa-25.0.7/src/freedreno/vulkan/tu_knl_drm_msm.cc	2025-05-28 15:20:23.000000000 +0000
++++ mesa-turnip/src/freedreno/vulkan/tu_knl_drm_msm.cc	2026-10-25 16:15:27.811265281 +0000
+@@ -740,6 +740,14 @@
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
+    /* TODO: Should we use the wrapper os_mmap() like Freedreno does? */
++#ifdef __APPLE__
++   (void)offset;
++   (void)placed_addr;
++   void *map = redwood_drm_map(dev->fd, bo->gem_handle, bo->size);
++   if (map == NULL)
++      map = MAP_FAILED;
++   if (0)
++#endif
+    void *map = mmap(placed_addr, bo->size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | (placed_addr != NULL ? MAP_FIXED : 0),
+                     dev->fd, offset);
+@@ -987,6 +995,32 @@
+       .queue_wait_fence = msm_queue_wait_fence,
+ };
+ 
++#ifdef __APPLE__
++/* Darwin on redwood: the one device, the kernel's GPU service (tu_knl.cc, tu_enumerate_devices). */
++VkResult tu_redwood_load(struct tu_instance *instance, int *fd, struct tu_physical_device **device);
++
++VkResult
++tu_redwood_load(struct tu_instance *instance, int *fd, struct tu_physical_device **device)
++{
++   drmVersionPtr version;
++   VkResult result;
++
++   *fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
++   if (*fd < 0)
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   version = drmGetVersion(*fd);
++   if (version == NULL) {
++      close(*fd);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++   result = tu_knl_drm_msm_load(instance, *fd, version, device);
++   drmFreeVersion(version);
++   if (result != VK_SUCCESS)
++      close(*fd);
++   return result;
++}
++#endif
++
+ VkResult
+ tu_knl_drm_msm_load(struct tu_instance *instance,
+                     int fd, struct _drmVersion *version,

@@ -155,6 +155,54 @@ static void eagl_leave(struct eagl *e, unsigned offset);
 static long eagl_missing(void *context, unsigned offset);
 #define EAGL_ENTER(context, offset)     eagl_enter(context, offset)
 #define EAGL_LEAVE(context, offset)     eagl_leave(context, offset)
+/*
+ * Where a frame's time goes (the "split" line of summary(), every 200 frames). The window of a frame is
+ * from the first entry CoreAnimation calls after the last frame's end to this frame's end; in it:
+ *   - the entries of the table: every one is timed, the generated ones in themselves and the ones
+ *     written by hand through a generated thunk (userland/mkeagl.py), each entry's own total kept too;
+ *   - inside the entries, the library: every gl* function eagl.c calls goes through a generated inline
+ *     wrapper that times it (mesa_glName); what the library takes outside an entry is the frame's end;
+ *   - eagl.c's own part of an entry is the entry's time less the library's in it;
+ *   - CoreAnimation is the window less the entries: its own work between one call and the next. The frame's
+ *     end (waiting, copying out) is inside glFlush's entry, so inside the calls, and said apart as well.
+ * In mach_absolute_time ticks; two reads a call, some 40 us a frame of ~400 calls.
+ */
+static unsigned split_depth;            /* entries in progress */
+static bool split_open;                 /* a frame's window has begun */
+static bool split_closing;              /* ... and frame_end() has been: it closes as the entry it is in returns */
+static uint64_t split_began;            /* ... at this tick */
+static uint64_t split_frame, split_entries, split_mesa_in, split_mesa_out;
+static uint64_t split_slot[0x440 / 8];  /* (SLOTS, defined below) each entry's own total */
+static void split_ab(uint64_t frame, uint64_t flush);
+#define EAGL_TIME_BEGIN \
+	uint64_t entry_t0 = mach_absolute_time(); \
+	if (!split_open) { \
+		split_open = true; \
+		split_began = entry_t0; \
+	} \
+	split_depth++
+#define EAGL_TIME_END(offset) do { \
+		uint64_t entry_d = mach_absolute_time() - entry_t0; \
+		split_depth--; \
+		if (split_depth == 0) { \
+			split_entries += entry_d; \
+			if (split_closing) { \
+				split_frame += mach_absolute_time() - split_began; \
+				split_ab(mach_absolute_time() - split_began, (offset) == 0x2d8 ? entry_d : 0); \
+				split_open = split_closing = false; \
+			} \
+		} \
+		split_slot[(offset) / 8] += entry_d; \
+	} while (0)
+#define MESA_TIME_BEGIN uint64_t mesa_t0 = mach_absolute_time()
+#define MESA_TIME_END do { \
+		uint64_t mesa_d = mach_absolute_time() - mesa_t0; \
+		if (split_depth != 0) { \
+			split_mesa_in += mesa_d; \
+		} else { \
+			split_mesa_out += mesa_d; \
+		} \
+	} while (0)
 
 #define EAGL_GEN_DECLARATIONS
 #include "eagl_gen.h"
@@ -363,6 +411,29 @@ static int blit_targets = 1;
 static int wait_for_frames = 1;
 static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
 /*
+ * CoreAnimation ends a frame with glFlush. Where the frame's end then copies the picture into the
+ * display's surface and flushes that copy (a mirror, see blit_targets), the first flush is not passed
+ * on: the copy is in the same context and after everything CoreAnimation drew, so the copy's flush sends
+ * all of it, in the same order. Every flush here is a synchronous one -- the context has IOSurfaces of
+ * the kernel's in it (Mesa's HasExternallySharedImages), so Mesa waits for its driver thread to empty
+ * -- and gl30 measured CoreAnimation's at 2-3 ms a frame. Boot-arg glflush1=1: passed on, as before;
+ * glflush1=2: frame by frame, one way and the other, and the split line says each apart (the same scenes).
+ */
+static int flush_twice;
+/*
+ * Boot-arg glasync=1: nor is the copy's flush a glFlush. The fence after it, asked to flush and waited
+ * for not at all, has Mesa's driver thread flush on its own (freedreno_fence.c fence_flush ->
+ * threaded_context_flush, prefer_async), so CoreAnimation's thread is at its next frame while that
+ * thread lays this one out -- gl32 measured the wait in glFlush at 4-5 ms a frame and the same with one
+ * flush as with two. The kernel keeps the display from showing the surface before the submission that
+ * draws it has come: the lock of LOCK_GPU_WROTE target_to_surface() takes is counted as announced, and
+ * the display waits for it (MiniIOSurfaceDrawn()).
+ */
+static int flush_async;
+static uint64_t ab_frame[2], ab_flush[2];       /* glflush1=2: [frame number & 1] the window and glFlush's entry */
+static unsigned ab_count[2];
+static uint64_t end_copy_us, end_flush_us, end_fence_us;        /* the frame's end in its parts (split_report()) */
+/*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
  * under the home screen's labels, when they are of the kind that darkens only what is light,
@@ -493,10 +564,91 @@ note_format(const char *how, GLenum internal, GLenum format, GLenum type, GLsize
 	}
 }
 
+/* glflush1=2: a frame that has ended, by the kind it was (the frame number is already the next one's less one) */
+static void
+split_ab(uint64_t frame, uint64_t flush)
+{
+	unsigned kind = 0;
+
+	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL && contexts[i] == current) {
+			kind = (current->frames - 1) & 1;       /* (frames was counted up in frame_end) */
+		}
+	}
+	ab_frame[kind] += frame;
+	ab_flush[kind] += flush;
+	ab_count[kind]++;
+}
+
+/* The "split" line: where the frames since the last one went (see EAGL_TIME_BEGIN), then cleared. */
+static void
+split_report(struct eagl *e)
+{
+	static unsigned since;
+	static uint64_t end_since;
+	mach_timebase_info_data_t base;
+	unsigned frames = e->frames - since, best[6] = { 0 };
+	uint64_t frame, entries, mesa_in, mesa_out, end;
+	char top[256] = "";
+	size_t n = 0;
+
+
+	if (frames == 0) {
+		return;
+	}
+	mach_timebase_info(&base);
+#define SPLIT_US(ticks) ((ticks) * base.numer / base.denom / 1000 / frames)
+	frame = SPLIT_US(split_frame);
+	entries = SPLIT_US(split_entries);
+	mesa_in = SPLIT_US(split_mesa_in);
+	mesa_out = SPLIT_US(split_mesa_out);
+	end = (e->wait_us + e->readback_us - end_since) / frames;
+	for (unsigned k = 0; k < 6; k++) {
+		for (unsigned i = 1; i < sizeof(split_slot) / sizeof(split_slot[0]); i++) {
+			bool taken = false;
+
+			for (unsigned j = 0; j < k; j++) {
+				taken |= best[j] == i;
+			}
+			if (!taken && split_slot[i] > split_slot[best[k]]) {
+				best[k] = i;
+			}
+		}
+		if (best[k] != 0 && split_slot[best[k]] != 0) {
+			n += (size_t)snprintf(top + n, sizeof(top) - n, "%s%s %llu", k ? ", " : "", eagl_slot_name(best[k] * 8),
+			    SPLIT_US(split_slot[best[k]]));
+			n = n < sizeof(top) ? n : sizeof(top) - 1;
+		}
+	}
+	say("redwood-gl: split, frames %u-%u: %llu us a frame: CoreAnimation %llu between the calls, the calls %llu "
+	    "(Mesa %llu, eagl %llu; of the calls, the frame's end waiting and copying out %llu: the copy %llu, its flush %llu, "
+	    "the fence %llu; CoreAnimation's own flush %s); Mesa outside the calls %llu; the calls that took most: %s\n",
+	    since + 1, e->frames, frame, frame > entries ? frame - entries : 0, entries, mesa_in,
+	    entries > mesa_in ? entries - mesa_in : 0, end, end_copy_us / frames, end_flush_us / frames, end_fence_us / frames,
+	    flush_twice ? "passed on (glflush1=1)" : "not passed on where the copy's flush follows", mesa_out, top);
+	end_copy_us = end_flush_us = end_fence_us = 0;
+	if (flush_twice == 2 && ab_count[0] != 0 && ab_count[1] != 0) {
+		say("redwood-gl: split, frames %u-%u, one flush or two: %u frames with two: %llu us a frame, glFlush %llu; "
+		    "%u with one: %llu us a frame, glFlush %llu\n", since + 1, e->frames, ab_count[0],
+		    ab_frame[0] * base.numer / base.denom / 1000 / ab_count[0], ab_flush[0] * base.numer / base.denom / 1000 / ab_count[0],
+		    ab_count[1], ab_frame[1] * base.numer / base.denom / 1000 / ab_count[1],
+		    ab_flush[1] * base.numer / base.denom / 1000 / ab_count[1]);
+	}
+	ab_frame[0] = ab_frame[1] = ab_flush[0] = ab_flush[1] = 0;
+	ab_count[0] = ab_count[1] = 0;
+#undef SPLIT_US
+	since = e->frames;
+	end_since = e->wait_us + e->readback_us;
+	split_frame = split_entries = split_mesa_in = split_mesa_out = 0;
+	memset(split_slot, 0, sizeof(split_slot));
+}
+
 static void
 summary(struct eagl *e)
 {
 	unsigned frames = e->frames ? e->frames : 1;
+
+	split_report(e);
 
 	say("redwood-gl: after %u frames: %llu calls, %llu draws and %llu triangles a frame on average; the most in one: "
 	    "%u calls, %u triangles; %llu us a frame, of which %llu handing the commands on, %llu waiting for the picture "
@@ -1029,6 +1181,19 @@ frame_begin(struct eagl *e)
  * library has been waited for already.
  */
 static void frame_functions(struct eagl *e);
+
+/* Will the frame's end copy a picture into its surface and flush the copy (see flush_twice)? */
+static bool
+mirror_pending(struct eagl *e)
+{
+	for (unsigned i = 0; i < e->image_count; i++) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 frame_end(struct eagl *e, bool finished)
 {
@@ -1040,11 +1205,21 @@ frame_end(struct eagl *e, bool finished)
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
+			uint64_t t0 = now_us(), t1;
+
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
 			in_place++;
-			glFlush();                              /* (also after a glFinish: the copy is new since) */
+			t1 = now_us();
+			if (!flush_async || finished || !sync_frames) {
+				glFlush();                      /* (also after a glFinish: the copy is new since) */
+			}
+			end_copy_us += t1 - t0;
+			end_flush_us += now_us() - t1;
 		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+			/* its lock of LOCK_GPU_WROTE before the flush that follows, not after: the kernel counts
+			 * it as a frame announced, and the display waits for a submission naming the surface */
+			target_to_surface(e, &e->images[i]);
 			in_place++;
 		}
 	}
@@ -1059,12 +1234,14 @@ frame_end(struct eagl *e, bool finished)
 		 * the cause of frames with parts missing; that was drawing into the surface itself, see
 		 * blit_targets.)
 		 */
+		uint64_t t0 = now_us();
 		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
 		if (sync != NULL) {
 			(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
 			glDeleteSync(sync);
 		}
+		end_fence_us += now_us() - t0;
 	}
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -1082,6 +1259,12 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	if (split_open && split_depth != 0) {
+		split_closing = true;           /* (inside glFlush or glFinish: the window takes that entry in whole) */
+	} else if (split_open) {
+		split_frame += mach_absolute_time() - split_began;
+		split_open = false;
+	}
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
@@ -3207,7 +3390,9 @@ my_glFlush(void *context)
 	}
 	clear_now(e);
 	began = now_us();
-	glFlush();
+	if (flush_twice == 1 || (flush_twice == 2 && (e->frames & 1) == 0) || !mirror_pending(e)) {
+		glFlush();
+	}
 	e->flushing += now_us() - began;
 	frame_end(e, false);
 	EAGL_LEAVE(e, 0x2d8);
@@ -4163,6 +4348,8 @@ install(void)
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
+		flush_twice = strstr(arguments, "glflush1=1") != NULL ? 1 : strstr(arguments, "glflush1=2") != NULL ? 2 : 0;
+		flush_async = strstr(arguments, "glasync=1") != NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}

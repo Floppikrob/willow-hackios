@@ -109,15 +109,29 @@ for name in set(re.findall(r'(?<![\w])(gl[A-Z]\w*)\s*\(', open(source_path).read
 for name in sorted(needed):
     ret, params = needed[name]
     emit('extern %s %s(%s);' % (ret, name, ', '.join('%s %s' % p for p in params) or 'void'))
+# ... and each of them through a wrapper that times it: from here on, eagl.c's glName is mesa_glName
+# (MESA_TIME_BEGIN / MESA_TIME_END are eagl.c's: the time a frame spends in the library itself)
+for name in sorted(needed):
+    ret, params = needed[name]
+    decl = ', '.join('%s %s' % p for p in params) or 'void'
+    args = ', '.join(p[1] for p in params)
+    if ret == 'void':
+        emit('static inline void\nmesa_%s(%s)\n{\n\tMESA_TIME_BEGIN;\n\t%s(%s);\n\tMESA_TIME_END;\n}' % (name, decl, name, args))
+    else:
+        emit('static inline %s\nmesa_%s(%s)\n{\n\tMESA_TIME_BEGIN;\n\t%s result = %s(%s);\n\tMESA_TIME_END;\n\treturn result;\n}'
+             % (ret, name, decl, ret, name, args))
+    emit('#define %s mesa_%s' % (name, name))
 emit('#endif')
 emit('#ifdef EAGL_GEN_TABLE')
 known = {}
+timed = set()                                   # hand-written entries reached through a timing thunk
 for offset, name, kind, function in entries:
     known[offset] = name
     if kind == 'pass':
         ret, params = protos[name]
         args = ', '.join(p[1] for p in params)
         emit('static %s\nslot_%04x(void *context%s)\n{' % (ret, offset, ''.join(', %s %s' % p for p in params)))
+        emit('\tEAGL_TIME_BEGIN;')
         emit('\tEAGL_ENTER(context, %#x);' % offset)
         emit('\tif (eagl_tracing) {\n\t\teagl_trace("%s(%s)\\n"%s);' % (name, ', '.join(trace_format(p[0]) for p in params),
              ''.join(', ' + trace_value(p) for p in params)))
@@ -127,9 +141,20 @@ for offset, name, kind, function in entries:
             emit('\t\teagl_trace_floats(value, count * %d);' % (n * n if vector.group(1) else n))
         emit('\t}')
         if ret == 'void':
-            emit('\t%s(%s);\n\tEAGL_LEAVE(context, %#x);\n}' % (function, args, offset))
+            emit('\t%s(%s);\n\tEAGL_LEAVE(context, %#x);\n\tEAGL_TIME_END(%#x);\n}' % (function, args, offset, offset))
         else:
-            emit('\t%s result = %s(%s);\n\tEAGL_LEAVE(context, %#x);\n\treturn result;\n}' % (ret, function, args, offset))
+            emit('\t%s result = %s(%s);\n\tEAGL_LEAVE(context, %#x);\n\tEAGL_TIME_END(%#x);\n\treturn result;\n}'
+                 % (ret, function, args, offset, offset))
+    elif kind == 'hand' and name in protos:
+        # the hand-written function, timed by a thunk of its own prototype: the table points to the thunk
+        ret, params = protos[name]
+        args = ''.join(', ' + p[1] for p in params)
+        emit('static %s\ntimed_%04x(void *context%s)\n{\n\tEAGL_TIME_BEGIN;' % (ret, offset, ''.join(', %s %s' % p for p in params)))
+        if ret == 'void':
+            emit('\t%s(context%s);\n\tEAGL_TIME_END(%#x);\n}' % (function, args, offset))
+        else:
+            emit('\t%s result = %s(context%s);\n\tEAGL_TIME_END(%#x);\n\treturn result;\n}' % (ret, function, args, offset))
+        timed.add(offset)
     elif kind == 'none':
         emit('static long slot_%04x(void *context) { return eagl_missing(context, %#x); }' % (offset, offset))
 top = max(known) + 0x100
@@ -144,7 +169,8 @@ emit('\tdefault: return "?";\n\t}\n}')
 emit('static void\neagl_fill_table(void **table)\n{')
 hand = {offset: function for offset, name, kind, function in entries if kind == 'hand'}
 for offset in range(8, top, 8):
-    emit('\ttable[%#x / 8] = (void *)%s;' % (offset, hand.get(offset, 'slot_%04x' % offset)))
+    emit('\ttable[%#x / 8] = (void *)%s;' % (offset, 'timed_%04x' % offset if offset in timed else
+                                                 hand.get(offset, 'slot_%04x' % offset)))
 emit('}')
 emit('#endif')
 print('\n'.join(out))

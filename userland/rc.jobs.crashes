@@ -1,0 +1,5 @@
+# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.crashes), on the willow with var_disk=1.
+# What iOS has kept in /private/var about crashes, out into the kernel log (src/show_files.c): the list of
+# reports, and backboardd and assetsd ones whole (up to 200 KB each).
+/redwood/bin/show_files /private/var/mobile/Library/Logs/CrashReporter backboardd 200000
+/redwood/bin/show_files /private/var/mobile/Library/Logs/CrashReporter assetsd 60000
