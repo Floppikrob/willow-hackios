@@ -23,10 +23,10 @@ This repository is half of the project:
 > is not affiliated with, authorised or endorsed by Apple Inc. iOS, iPhone and Apple are trademarks of Apple Inc.
 
 <p>
-<img src="docs/lockscreen.jpg" width="190" alt="Lock screen">
-<img src="docs/homescreen.jpg" width="190" alt="Home screen">
-<img src="docs/control-center.jpg" width="190" alt="Control Center">
-<img src="docs/settings.jpg" width="190" alt="Settings">
+<img src="lockscreen.jpg" width="190" alt="Lock screen">
+<img src="homescreen.jpg" width="190" alt="Home screen">
+<img src="control-center.jpg" width="190" alt="Control Center">
+<img src="settings.jpg" width="190" alt="Settings">
 </p>
 
 Photographed on the phone, the Adreno GPU drawing (`gpu=1`). More in [Screenshots](#screenshots).
@@ -127,13 +127,13 @@ Every release has `hackios-redwood-boot.img` attached: the redwood UEFI with our
 `common/build.sh <device>` runs every step that this machine can run and uses `prebuilt/` for the rest.
 
 - **Kernel** — needs [theos](https://theos.dev/docs/installation-linux) in `~/theos` (cctools and
-  `iPhoneOS16.5.sdk`) and `clang lld python perl`. Details: [xnu/README.md](xnu/README.md).
+  `iPhoneOS16.5.sdk`) and `clang lld python perl`. Details: [xnu/README.md](../xnu/README.md).
   ```sh
   xnu/apply.sh && xnu-deps/setup.sh && ./xnu-build.sh -j8 -k
   ```
 - **Loader** — `xnuloader/build.sh` (clang + lld-link, an EFI application without EDK2).
 - **Images** — `REST=1 userland/build.sh` (variables documented at the top of that file).
-- **UEFI** — [uefi/README.md](uefi/README.md) (Project Silicium port); not needed to run, `prebuilt/uefi` has it.
+- **UEFI** — [uefi/README.md](../uefi/README.md) (Project Silicium port); not needed to run, `prebuilt/uefi` has it.
 - After rebuilding: `tools/update-prebuilt.sh` refreshes `prebuilt/`.
 
 ## Porting to another device
@@ -142,7 +142,7 @@ Every release has `hackios-redwood-boot.img` attached: the redwood UEFI with our
 common/new-device.sh <codename> path/to/device.dtb   # profile + loader platform from the phone's device tree
 ```
 
-Then follow [docs/PORTING.md](docs/PORTING.md): the UEFI port, the loader's platform description, the kernel's
+Then follow [docs/PORTING.md](PORTING.md): the UEFI port, the loader's platform description, the kernel's
 drivers, the firmware. Device profiles live in `common/devices/` (`redwood.conf`, `qemu-virt.conf`, `_template.conf`).
 
 ## How it works
@@ -184,7 +184,7 @@ kernel (driver replacements) or by a library the kernel injects with `DYLD_INSER
 | `qemu/` | QEMU runs, touch input, screenshots, stack symbolication |
 | `tools/` | recording (`recording.py`, `sound.py`), UFS/flash tools, `mk-ath11k.sh`, `new-workspace.sh`, host tests |
 | `prebuilt/` | built kernel, loader and UEFI pieces (`NOTICES.md` for the third-party code in the kernel) |
-| `docs/` | screenshots, [checks.md](docs/checks.md), [PORTING.md](docs/PORTING.md) |
+| `docs/` | screenshots, [checks.md](checks.md), [PORTING.md](PORTING.md) |
 
 ## Debugging
 
@@ -193,25 +193,25 @@ kernel (driver replacements) or by a library the kernel injects with `DYLD_INSER
 - `userabort:` in the log is the stack of a process that called `abort()`; `usertrap:` (with `systrace=1`) — crashes.
 - Live stacks (QEMU): `qemu/touch.py stacks NAME`, then `qemu/symstack.py LOG NAME`
   (needs [`ipsw`](https://github.com/blacktop/ipsw)).
-- How a check can lie to you: [docs/checks.md](docs/checks.md).
+- How a check can lie to you: [docs/checks.md](checks.md).
 
 ## Screenshots
 
 From the phone's screen, one session (`GL=1 REST=1`, `gpu=1`):
 
 <p>
-<img src="docs/homescreen-2.jpg" width="160" alt="Home screen, page 2">
-<img src="docs/search.jpg" width="160" alt="Search">
-<img src="docs/settings-general.jpg" width="160" alt="Settings > General">
-<img src="docs/calendar.jpg" width="160" alt="Calendar">
-<img src="docs/clock.jpg" width="160" alt="Clock">
+<img src="homescreen-2.jpg" width="160" alt="Home screen, page 2">
+<img src="search.jpg" width="160" alt="Search">
+<img src="settings-general.jpg" width="160" alt="Settings > General">
+<img src="calendar.jpg" width="160" alt="Calendar">
+<img src="clock.jpg" width="160" alt="Clock">
 </p>
 <p>
-<img src="docs/wallet.jpg" width="160" alt="Wallet">
-<img src="docs/messages.jpg" width="160" alt="Messages">
-<img src="docs/music.jpg" width="160" alt="Music">
-<img src="docs/maps.jpg" width="160" alt="Maps">
-<img src="docs/appstore-tabs.png" width="160" alt="App Store">
+<img src="wallet.jpg" width="160" alt="Wallet">
+<img src="messages.jpg" width="160" alt="Messages">
+<img src="music.jpg" width="160" alt="Music">
+<img src="maps.jpg" width="160" alt="Maps">
+<img src="appstore-tabs.png" width="160" alt="App Store">
 </p>
 
 ## Licenses
@@ -219,7 +219,7 @@ From the phone's screen, one session (`GL=1 REST=1`, `gpu=1`):
 - No iOS files are in the repositories: `ios165/fetch.sh` downloads them from Apple's CDN to your machine.
 - `xnu/` is a derivative work of XNU and is distributed under APSL 2.0, like XNU itself; `prebuilt/mach.*` is the
   kernel built from it. It also contains ath11k (BSD-3-Clause-Clear) and FreeBSD LinuxKPI code (BSD-2-Clause):
-  see [prebuilt/NOTICES.md](prebuilt/NOTICES.md).
+  see [prebuilt/NOTICES.md](../prebuilt/NOTICES.md).
 - `xnu/files/bsd/miscfs/apfs/libzbitmap/` and `xnu-deps/build/lzbitmap/` — libzbitmap (Corellium LLC, MIT here);
   `xnu/files/bsd/miscfs/apfs/libdeflate/` — libdeflate 1.24 (Eric Biggers, MIT, `COPYING` there).
 - ath11k, Linux and FreeBSD sources are not in the repository: `tools/mk-ath11k.sh` fetches pinned releases.
