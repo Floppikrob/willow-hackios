@@ -1089,6 +1089,15 @@ a610_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x03:                              /* CHIP_ID */
 		*value = GPU_CHIP_ID_A610;
 		return true;
+	case 0x06:                              /* GMEM_BASE */
+		/*
+		 * Where the GMEM is in the core's addresses: 0x100000 for every Adreno 6xx but the 650 and 740
+		 * families (Linux adreno_gpu.c), and where step 11 puts UCHE_GMEM_RANGE. Answered 0 (redwood's,
+		 * an A650-family GPU), Mesa's tiles went outside the GMEM and the core hung a few frames in
+		 * (willow-gl5, gl7); with Mesa kept out of the GMEM (FD_MESA_DEBUG=sysmem) it did not (gl6, gl8).
+		 */
+		*value = 0x00100000;
+		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = (core_mhz ? core_mhz : 19) * 1000000ull;
 		return true;
